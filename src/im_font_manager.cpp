@@ -19,6 +19,13 @@
 #include <fstream>
 #include <deque>
 #include <cassert>
+#include <algorithm>
+#include <climits>
+
+#ifndef _WIN32
+#define _MAX_PATH PATH_MAX
+#define strncpy_s(dest, destsz, src, count) strncpy(dest, src, count)
+#endif
 
 #include "imrichtext.h"
 #include "context.h"

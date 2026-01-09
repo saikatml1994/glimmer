@@ -464,6 +464,7 @@ namespace glimmer
             deferedRenderer->Reset();
             return *Config.renderer;
         }
+        return *Config.renderer;
     }
 
     IRenderer& WidgetContextData::GetRenderer()

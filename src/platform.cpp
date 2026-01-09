@@ -19,8 +19,10 @@ static void DetermineKeyStatus(glimmer::IODescriptor& desc)
     desc.insert = GetAsyncKeyState(VK_INSERT) < 0;
 }
 #elif __linux__
-#include <ctsdio>
+#include <cstdio>
 #include <unistd.h>
+#include <string>
+#include <stdexcept>
 
 static std::string exec(const char* cmd)
 {
@@ -174,7 +176,7 @@ namespace glimmer
 
     int32_t IPlatform::ShowFileDialog(std::span<char>* out, int32_t outsz, int32_t target,
         std::string_view location, std::pair<std::string_view, std::string_view>* filters,
-        int totalFilters, const DialogProperties& props)
+        int totalFilters, const DialogProperties* props)
     {
         return 0;
     }

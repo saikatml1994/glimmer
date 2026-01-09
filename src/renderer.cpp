@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <charconv>
 #include <limits>
+#include <algorithm>
 
 #ifndef GLIMMER_DISABLE_GIF
 #include <chrono>
@@ -163,7 +164,7 @@ namespace glimmer
 
             auto sz = buffer.size();
             buffer.expand(bufsz);
-            std::fread(buffer.data() + sz, 1, bufsz, fptr);
+            [[maybe_unused]] auto bytes_read = std::fread(buffer.data() + sz, 1, bufsz, fptr);
             std::fclose(fptr);
             return { sz, sz + bufsz };
         }

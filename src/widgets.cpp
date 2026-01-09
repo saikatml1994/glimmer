@@ -307,6 +307,7 @@ namespace glimmer
         case glimmer::TextType::SVG: return ImVec2{ font.size, font.size };
         default: break;
         }
+        return ImVec2{0.f, 0.f};
     }
 
     template <typename StringT>
@@ -2013,7 +2014,7 @@ namespace glimmer
         auto radius = (extent.GetHeight() * 0.5f) - (2.f * extra);
         auto movement = extent.GetWidth() - (2.f * (radius + extra));
         auto moveAmount = toggle.animate ? (io.deltaTime / specificStyle.animate) * movement * (state.checked ? 1.f : -1.f) : 0.f;
-        toggle.progress += std::fabsf(moveAmount / movement);
+        toggle.progress += std::fabs(moveAmount / movement);
 
         auto center = toggle.btnpos == -1.f ? state.checked ? extent.Max - ImVec2{ extra + radius, extra + radius }
             : extent.Min + ImVec2{ radius + extra, extra + radius }
@@ -2028,8 +2029,10 @@ namespace glimmer
         {
             auto prevTCol = state.checked ? context.toggleButtonStyles[WSI_Default].top().trackColor :
                 context.toggleButtonStyles[WSI_Checked].top().trackColor;
-            auto [fr, fg, fb, fa] = DecomposeColor(prevTCol);
-            auto [tr, tg, tb, ta] = DecomposeColor(tcol);
+            auto fromColor = DecomposeColor(prevTCol);
+            auto toColor = DecomposeColor(tcol);
+            int fr = std::get<0>(fromColor), fg = std::get<1>(fromColor), fb = std::get<2>(fromColor), fa = std::get<3>(fromColor);
+            int tr = std::get<0>(toColor), tg = std::get<1>(toColor), tb = std::get<2>(toColor), ta = std::get<3>(toColor);
             tr = (int)((1.f - toggle.progress) * (float)fr + toggle.progress * (float)tr);
             tg = (int)((1.f - toggle.progress) * (float)fg + toggle.progress * (float)tg);
             tb = (int)((1.f - toggle.progress) * (float)fb + toggle.progress * (float)tb);
@@ -2294,7 +2297,7 @@ namespace glimmer
 
     static ImRect SpinnerBounds(int32_t id, const SpinnerState& state, IRenderer& renderer, const ImRect& extent)
     {
-        auto digits = (int)(std::ceilf(std::log10f(state.max) + 1.f)) + (!state.isInteger ? state.precision + 1 : 0);
+        auto digits = (int)(std::ceil(std::log10(state.max) + 1.0)) + (!state.isInteger ? state.precision + 1 : 0);
         auto& context = GetContext();
         const auto style = context.GetStyle(state.state, state.id);
 
@@ -2303,7 +2306,7 @@ namespace glimmer
         memset(buffer, '0', digits);
         buffer[digits] = 0;
 
-        std::string_view text{ buffer, (size_t)digits };
+        std::string_view text(buffer, (size_t)digits);
         auto txtsz = renderer.GetTextSize(text, style.font.font, style.font.size);
         ImRect result;
         result.Min = extent.Min;
@@ -3182,7 +3185,7 @@ namespace glimmer
                 {
                     auto posx = mousepos.x - content.Min.x;
                     if (input.selectionStart == -1.f) input.selectionStart = posx;
-                    else if ((std::fabsf(input.selectionStart - posx) > 5.f) || input.isSelecting)
+                    else if ((std::fabs(input.selectionStart - posx) > 5.f) || input.isSelecting)
                     {
                         if (state.selection.first == -1)
                         {
@@ -3213,7 +3216,7 @@ namespace glimmer
                             {
                                 if ((prevpos < input.caretpos) && (input.pixelpos[input.caretpos - 1] - input.scroll.state.pos.x > content.GetWidth()))
                                 {
-                                    auto width = std::fabsf(input.pixelpos[input.caretpos - 1] - (input.caretpos > 1 ? input.pixelpos[input.caretpos - 2] : 0.f));
+                                    auto width = std::fabs(input.pixelpos[input.caretpos - 1] - (input.caretpos > 1 ? input.pixelpos[input.caretpos - 2] : 0.f));
                                     input.moveRight(width);
                                 }
                             }
@@ -3221,7 +3224,7 @@ namespace glimmer
                             {
                                 if (prevpos > input.caretpos && (input.pixelpos[input.caretpos - 1] - input.scroll.state.pos.x < 0.f))
                                 {
-                                    auto width = std::fabsf(input.pixelpos[prevpos - 1] - (prevpos > 1 ? input.pixelpos[prevpos - 2] : 0.f));
+                                    auto width = std::fabs(input.pixelpos[prevpos - 1] - (prevpos > 1 ? input.pixelpos[prevpos - 2] : 0.f));
                                     input.moveLeft(width);
                                 }
                             }
@@ -3236,7 +3239,7 @@ namespace glimmer
                     auto posx = mousepos.x - content.Min.x;
 
                     // This means we have clicked, not selecting text
-                    if (std::fabsf(input.selectionStart - posx) < 5.f)
+                    if (std::fabs(input.selectionStart - posx) < 5.f)
                     {
                         auto it = std::lower_bound(input.pixelpos.begin(), input.pixelpos.end(), posx + input.scroll.state.pos.x);
                         auto idx = it - input.pixelpos.begin();
@@ -3333,7 +3336,7 @@ namespace glimmer
 
                             if (prevpos > input.caretpos && (input.pixelpos[input.caretpos - 1] - input.scroll.state.pos.x < 0.f))
                             {
-                                auto width = std::fabsf(input.pixelpos[prevpos - 1] - (prevpos > 1 ? input.pixelpos[prevpos - 2] : 0.f));
+                                auto width = std::fabs(input.pixelpos[prevpos - 1] - (prevpos > 1 ? input.pixelpos[prevpos - 2] : 0.f));
                                 input.moveLeft(width);
                             }
                         }
@@ -3360,7 +3363,7 @@ namespace glimmer
 
                             if ((prevpos < input.caretpos) && (input.pixelpos[input.caretpos - 1] - input.scroll.state.pos.x > content.GetWidth()))
                             {
-                                auto width = std::fabsf(input.pixelpos[input.caretpos - 1] - (input.caretpos > 1 ? input.pixelpos[input.caretpos - 2] : 0.f));
+                                auto width = std::fabs(input.pixelpos[input.caretpos - 1] - (input.caretpos > 1 ? input.pixelpos[input.caretpos - 2] : 0.f));
                                 input.moveRight(width);
                             }
                         }
@@ -4790,7 +4793,7 @@ namespace glimmer
             {
                 ImVec2 center{ tab.pin.Min.x + (tab.pin.GetWidth() * 0.5f), tab.pin.Min.y +
                     (tab.pin.GetHeight() * 0.5f) };
-                auto radius = (1.f / std::sqrtf(2)) * tab.pin.GetWidth();
+                auto radius = (1.f / std::sqrt(2)) * tab.pin.GetWidth();
                 renderer.DrawCircle(center, radius, specificStyle.pinbgcolor, true);
             }
             else
@@ -4808,7 +4811,7 @@ namespace glimmer
             {
                 ImVec2 center{ tab.close.Min.x + (tab.close.GetWidth() * 0.5f), tab.close.Min.y +
                     (tab.close.GetHeight() * 0.5f) };
-                auto radius = (1.f / std::sqrtf(2)) * tab.close.GetWidth();
+                auto radius = (1.f / std::sqrt(2)) * tab.close.GetWidth();
                 renderer.DrawCircle(center, radius, specificStyle.closebgcolor, true);
             }
             else
@@ -8592,7 +8595,7 @@ namespace glimmer
         case WT_Custom: {
             if (Config.customWidget != nullptr)
             {
-                const auto style = Config.customWidget->GetStyle(wid, WidgetContextData::StyleStack);
+                const auto style = Config.customWidget->GetStyle(wid, WidgetContextData::StyleStack[WSI_Default]);
 
                 if (nestedCtx.source == NestedContextSourceType::Layout && !context.layoutStack.empty())
                 {
