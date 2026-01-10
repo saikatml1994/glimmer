@@ -4,6 +4,24 @@
 
 set -e  # Exit on error
 
+# Enable newer GCC if available (needed for C++20 support)
+if [ -f /opt/rh/gcc-toolset-11/enable ]; then
+    echo "Enabling GCC Toolset 11..."
+    source /opt/rh/gcc-toolset-11/enable
+elif [ -f /opt/rh/devtoolset-11/enable ]; then
+    echo "Enabling DevToolset 11..."
+    source /opt/rh/devtoolset-11/enable
+elif [ -f /opt/rh/gcc-toolset-12/enable ]; then
+    echo "Enabling GCC Toolset 12..."
+    source /opt/rh/gcc-toolset-12/enable
+else
+    echo "Warning: No newer GCC toolset found. Using system GCC $(gcc --version | head -1)"
+    echo "Build may fail. Install with: sudo yum install gcc-toolset-11"
+fi
+
+gcc --version | head -1
+echo ""
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,7 +56,8 @@ print_usage() {
     echo ""
     echo "Options:"
     echo "  -h, --help              Show this help message"
-    echo "  -d, --debug             Build in Debug mode (default: Release)"
+    echo "  -r, --release           Build in Release mode (optimized, default)"
+    echo "  -d, --debug             Build in Debug mode (with debug symbols)"
     echo "  -c, --clean             Clean build directory before building"
     echo "  --no-svg                Disable SVG support"
     echo "  --no-images             Disable image support"
@@ -54,6 +73,10 @@ while [[ $# -gt 0 ]]; do
         -h|--help)
             print_usage
             exit 0
+            ;;
+        -r|--release)
+            BUILD_TYPE="Release"
+            shift
             ;;
         -d|--debug)
             BUILD_TYPE="Debug"
@@ -133,8 +156,18 @@ if [ "$ENABLE_BLEND2D" = true ]; then
 fi
 
 # Run CMake
-echo -e "${GREEN}Running CMake...${NC}"
+echo ""
+echo -e "${GREEN}========================================${NC}"
+echo -e "${GREEN}Configuring Glimmer Build${NC}"
+echo -e "${GREEN}========================================${NC}"
 echo -e "${YELLOW}Build Type: $BUILD_TYPE${NC}"
+if [ "$BUILD_TYPE" = "Debug" ]; then
+    echo -e "${YELLOW}Using dependencies from: src/libs/lib/linux/debug/${NC}"
+else
+    echo -e "${YELLOW}Using dependencies from: src/libs/lib/linux/release/${NC}"
+fi
+echo -e "${GREEN}========================================${NC}"
+echo ""
 cmake $CMAKE_OPTIONS ..
 
 # Build
@@ -145,14 +178,15 @@ make -j$(nproc)
 if [ -f "${SCRIPT_DIR}/staticlib/libglimmer.a" ]; then
     echo ""
     echo -e "${GREEN}========================================${NC}"
-    echo -e "${GREEN}Build successful!${NC}"
+    echo -e "${GREEN}Build Successful! ($BUILD_TYPE)${NC}"
     echo -e "${GREEN}========================================${NC}"
     echo ""
-    echo -e "Static library created at: ${GREEN}${SCRIPT_DIR}/staticlib/libglimmer.a${NC}"
+    echo -e "Static library: ${GREEN}${SCRIPT_DIR}/staticlib/libglimmer.a${NC}"
     
     # Show library size
     LIB_SIZE=$(du -h "${SCRIPT_DIR}/staticlib/libglimmer.a" | cut -f1)
     echo -e "Library size: ${YELLOW}${LIB_SIZE}${NC}"
+    echo -e "Build type: ${YELLOW}${BUILD_TYPE}${NC}"
     echo ""
 else
     echo -e "${RED}Build failed - library not found${NC}"

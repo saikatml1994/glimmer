@@ -93,28 +93,24 @@ set(GLIMMER_HEADERS
     glimmer.h
 )
 
-# ImGui and related library sources
-set(IMGUI_SOURCES
-    src/libs/src/imgui.cpp
-    src/libs/src/imgui_demo.cpp
-    src/libs/src/imgui_draw.cpp
-    src/libs/src/imgui_tables.cpp
-    src/libs/src/imgui_widgets.cpp
-    src/libs/src/imgui_impl_glfw.cpp
-    src/libs/src/imgui_impl_opengl3.cpp
-)
-
-# ImRichText sources (unless disabled)
+# ImRichText sources (only these, ImGui is prebuilt)
+set(EXTRA_SOURCES)
 if(NOT GLIMMER_DISABLE_RICHTEXT)
-    list(APPEND IMGUI_SOURCES
+    list(APPEND EXTRA_SOURCES
         src/libs/src/imrichtext.cpp
         src/libs/src/imrichtextimpl.cpp
         src/libs/src/imrichtextutils.cpp
     )
 endif()
 
+# Platform implementation sources
+list(APPEND EXTRA_SOURCES
+    src/libs/src/imgui_impl_glfw.cpp
+    src/libs/src/imgui_impl_opengl3.cpp
+)
+
 # Combine all sources
-set(ALL_SOURCES ${GLIMMER_SOURCES} ${IMGUI_SOURCES})
+set(ALL_SOURCES ${GLIMMER_SOURCES} ${EXTRA_SOURCES})
 
 # Create static library
 add_library(glimmer STATIC ${ALL_SOURCES})
@@ -178,6 +174,13 @@ if(UNIX AND NOT APPLE)
         m  # Math library
     )
     
+    # X11 libraries (required for SDL3 with X11 support)
+    find_package(X11)
+    if(X11_FOUND)
+        target_link_libraries(glimmer PUBLIC ${X11_LIBRARIES})
+        message(STATUS "Linking X11 libraries for SDL3")
+    endif()
+    
     # Link against bundled static libraries for Linux
     set(LINUX_LIB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/libs/lib/linux")
     
@@ -210,6 +213,38 @@ if(UNIX AND NOT APPLE)
         message(STATUS "Linking bundled SDL3 (${LIB_SUBDIR})")
     else()
         message(STATUS "SDL3 not found (optional)")
+    endif()
+    
+    # Link FreeType (for font rendering)
+    if(EXISTS "${LINUX_LIB_DIR}/${LIB_SUBDIR}/libfreetype.a")
+        target_link_libraries(glimmer PUBLIC "${LINUX_LIB_DIR}/${LIB_SUBDIR}/libfreetype.a")
+        message(STATUS "Linking bundled FreeType (${LIB_SUBDIR})")
+    else()
+        message(WARNING "FreeType not found in ${LINUX_LIB_DIR}/${LIB_SUBDIR}/")
+    endif()
+    
+    # Link ImGui (for immediate mode GUI)
+    if(EXISTS "${LINUX_LIB_DIR}/${LIB_SUBDIR}/libimgui.a")
+        target_link_libraries(glimmer PUBLIC "${LINUX_LIB_DIR}/${LIB_SUBDIR}/libimgui.a")
+        message(STATUS "Linking bundled ImGui (${LIB_SUBDIR})")
+    else()
+        message(WARNING "ImGui not found in ${LINUX_LIB_DIR}/${LIB_SUBDIR}/")
+    endif()
+    
+    # Link ImPlot (for plotting support)
+    if(EXISTS "${LINUX_LIB_DIR}/${LIB_SUBDIR}/libimplot.a")
+        target_link_libraries(glimmer PUBLIC "${LINUX_LIB_DIR}/${LIB_SUBDIR}/libimplot.a")
+        message(STATUS "Linking bundled ImPlot (${LIB_SUBDIR})")
+    else()
+        message(WARNING "ImPlot not found in ${LINUX_LIB_DIR}/${LIB_SUBDIR}/")
+    endif()
+    
+    # Link Yoga (for flexbox layout)
+    if(EXISTS "${LINUX_LIB_DIR}/${LIB_SUBDIR}/libyogacore.a")
+        target_link_libraries(glimmer PUBLIC "${LINUX_LIB_DIR}/${LIB_SUBDIR}/libyogacore.a")
+        message(STATUS "Linking bundled Yoga (${LIB_SUBDIR})")
+    else()
+        message(WARNING "Yoga not found in ${LINUX_LIB_DIR}/${LIB_SUBDIR}/")
     endif()
     
     # Link blend2d (if enabled)
