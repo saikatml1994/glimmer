@@ -1,0 +1,315 @@
+diff --git a/src/im_font_manager.cpp b/src/im_font_manager.cpp
+index 0b8aa40..2715a62 100644
+--- a/src/im_font_manager.cpp
++++ b/src/im_font_manager.cpp
+@@ -19,6 +19,14 @@
+ #include <fstream>
+ #include <deque>
+ #include <cassert>
++#include <algorithm>
++
++#ifndef _WIN32
++#include <limits.h>
++#ifndef _MAX_PATH
++#define _MAX_PATH PATH_MAX
++#endif
++#endif
+ 
+ #include "imrichtext.h"
+ #include "context.h"
+@@ -427,8 +435,12 @@ namespace glimmer
+                 {
+                     auto baseFontPath = BaseFontPaths[idx];
+                     memset(baseFontPath, 0, _MAX_PATH);
+-                    auto sz = std::min((int)names->BasePath.size(), _MAX_PATH);
++                    auto sz = std::min((int)names->BasePath.size(), _MAX_PATH - 1);
++#ifdef _WIN32
+                     strncpy_s(baseFontPath, _MAX_PATH - 1, names->BasePath.data(), sz);
++#else
++                    strncpy(baseFontPath, names->BasePath.data(), sz);
++#endif
+                     baseFontPath[sz] = '\0';
+                 }
+             }
+diff --git a/src/layout.cpp b/src/layout.cpp
+index 300ae0f..a67e015 100644
+--- a/src/layout.cpp
++++ b/src/layout.cpp
+@@ -9,6 +9,7 @@
+ #include "widgets.h"
+ 
+ #include <limits>
++#include <cstdint>
+ 
+ #define GLIMMER_FLAT_ENGINE 0
+ #define GLIMMER_CLAY_ENGINE 1
+@@ -2227,7 +2228,7 @@ namespace glimmer
+         {
+             auto sz = layout.geometry.GetSize();
+             auto itemidx = layout.itemidx;
+-            auto gridItemIdx = reinterpret_cast<int>(context.layoutItems[itemidx].implData);
++            auto gridItemIdx = reinterpret_cast<intptr_t>(context.layoutItems[itemidx].implData);
+             auto& item = GridLayoutItems[gridItemIdx];
+             item.maxdim = sz;
+         }
+@@ -2430,7 +2431,7 @@ namespace glimmer
+                 }
+                 else if (layout.type == Layout::Grid)
+                 {
+-                    auto idx = reinterpret_cast<int16_t>(item.implData);
++                    auto idx = static_cast<int16_t>(reinterpret_cast<intptr_t>(item.implData));
+                     auto bbox = GridLayoutItems[idx].bbox;
+                     UpdateItemGeometry(context, bbox, item, layout);
+                 }
+diff --git a/src/libs/src/imrichtext.cpp b/src/libs/src/imrichtext.cpp
+index fcb7ff1..5cdda43 100644
+--- a/src/libs/src/imrichtext.cpp
++++ b/src/libs/src/imrichtext.cpp
+@@ -2321,7 +2321,6 @@ namespace ImRichText
+ 
+             for (auto& segment : line.Segments)
+             {
+-                auto& segment = line.Segments.front();
+                 auto& style = _result.StyleDescriptors[segment.StyleIdx + 1];
+ 
+                 // If complete text is already clipped, do not apply alignment
+diff --git a/src/libs/src/imrichtextutils.cpp b/src/libs/src/imrichtextutils.cpp
+index 4a16815..8660c1b 100644
+--- a/src/libs/src/imrichtextutils.cpp
++++ b/src/libs/src/imrichtextutils.cpp
+@@ -2,6 +2,7 @@
+ #include "imrichtextutils.h"
+ 
+ #include <cctype>
++#include <cstring>
+ #include <unordered_map>
+ 
+ #include "renderer.h"
+diff --git a/src/platform.cpp b/src/platform.cpp
+index 48fce68..25630b8 100644
+--- a/src/platform.cpp
++++ b/src/platform.cpp
+@@ -2,6 +2,9 @@
+ #include "context.h"
+ #include "renderer.h"
+ 
++#include <string>
++#include <stdexcept>
++
+ #if defined(GLIMMER_ENABLE_NFDEXT) && !defined(__EMSCRIPTEN__)
+ #include "nfd-ext/src/include/nfd.h"
+ #endif
+@@ -19,7 +22,7 @@ static void DetermineKeyStatus(glimmer::IODescriptor& desc)
+     desc.insert = GetAsyncKeyState(VK_INSERT) < 0;
+ }
+ #elif __linux__
+-#include <ctsdio>
++#include <cstdio>
+ #include <unistd.h>
+ 
+ static std::string exec(const char* cmd)
+@@ -90,7 +93,7 @@ namespace glimmer
+ 
+     int32_t IPlatform::ShowFileDialog(std::span<char>* out, int32_t outsz, int32_t target,
+         std::string_view location, std::pair<std::string_view, std::string_view>* filters,
+-        int totalFilters, const DialogProperties& props)
++        int totalFilters, const DialogProperties* props)
+     {
+         assert(out != nullptr && outsz >= 1);
+         static Vector<nfdu8filteritem_t, int16_t, 16> filterItems{ false };
+@@ -174,7 +177,7 @@ namespace glimmer
+ 
+     int32_t IPlatform::ShowFileDialog(std::span<char>* out, int32_t outsz, int32_t target,
+         std::string_view location, std::pair<std::string_view, std::string_view>* filters,
+-        int totalFilters, const DialogProperties& props)
++        int totalFilters, const DialogProperties* props)
+     {
+         return 0;
+     }
+diff --git a/src/platform.h b/src/platform.h
+index 727a8b6..3cef2a7 100644
+--- a/src/platform.h
++++ b/src/platform.h
+@@ -202,9 +202,9 @@ namespace glimmer
+ 
+         struct DialogProperties
+         {
+-            std::string_view title;
+-            std::string_view confirmBtnText = "OK";
+-            std::string_view cancelBtnText = "Cancel";
++            std::string_view title{};
++            std::string_view confirmBtnText{"OK"};
++            std::string_view cancelBtnText{"Cancel"};
+         };
+ 
+         friend int64_t FramesRendered();
+@@ -219,7 +219,7 @@ namespace glimmer
+         virtual void GetWindowHandle(void*);
+         virtual int32_t ShowFileDialog(std::span<char>* out, int32_t outsz, int32_t target,
+             std::string_view location, std::pair<std::string_view, std::string_view>* filters = nullptr,
+-            int totalFilters = 0, const DialogProperties& props = DialogProperties{});
++            int totalFilters = 0, const DialogProperties* props = nullptr);
+ 
+         void SetMouseCursor(MouseCursor cursor);
+ 
+diff --git a/src/renderer.cpp b/src/renderer.cpp
+index ac11231..5041dcc 100644
+--- a/src/renderer.cpp
++++ b/src/renderer.cpp
+@@ -6,6 +6,7 @@
+ #include <cstdio>
+ #include <charconv>
+ #include <limits>
++#include <algorithm>
+ 
+ #ifndef GLIMMER_DISABLE_GIF
+ #include <chrono>
+diff --git a/src/style.cpp b/src/style.cpp
+index 7fa3bc9..82ed646 100644
+--- a/src/style.cpp
++++ b/src/style.cpp
+@@ -2,6 +2,8 @@
+ #include "context.h"
+ 
+ #include <cctype>
++#include <cstring>
++#include <cstdio>
+ #include <unordered_map>
+ #include <variant>
+ #include "style.h"
+diff --git a/src/types.h b/src/types.h
+index dacd5ea..dfc009f 100644
+--- a/src/types.h
++++ b/src/types.h
+@@ -9,6 +9,7 @@
+ #include <string_view>
+ #include <optional>
+ #include <vector>
++#include <tuple>
+ 
+ #ifndef GLIMMER_DEFAULT_FONTFAMILY
+ #define GLIMMER_DEFAULT_FONTFAMILY "default-font-family"
+@@ -429,7 +430,7 @@ namespace glimmer
+         std::pair<int, int> selection{ -1, -1 };
+         std::string_view prefix, suffix;
+         int32_t prefixType = RT_INVALID, suffixType = RT_INVALID;
+-		std::string_view maskchar = "•";
++		std::string_view maskchar = "ï¿½";
+         void (*ShowList)(const TextInputState&, ImVec2, ImVec2) = nullptr;
+         float overlayHeight = FLT_MAX;
+         SymbolIcon suffixIcon = SymbolIcon::None;
+diff --git a/src/utils.h b/src/utils.h
+index bc683c8..406152c 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -5,6 +5,7 @@
+ #include <optional>
+ #include <stdint.h>
+ #include <assert.h>
++#include <cstdlib>
+ 
+ #ifdef _DEBUG
+ #include <cstdio>
+@@ -160,7 +161,7 @@ namespace glimmer
+         }
+ 
+         template <typename IntegralT,
+-            typename = std::enable_if<!std::is_same_v<IntegralT, bool>, void>::type>
++            typename = std::enable_if_t<std::is_integral_v<IntegralT> && !std::is_same_v<IntegralT, bool>>>
+         explicit Vector(IntegralT initialsz)
+             : _capacity{ (Sz)initialsz }, _data{ (T*)AllocateFunc(sizeof(T) * (Sz)initialsz) }
+         {
+diff --git a/src/widgets.cpp b/src/widgets.cpp
+index d9ef353..f094710 100644
+--- a/src/widgets.cpp
++++ b/src/widgets.cpp
+@@ -2013,7 +2013,7 @@ namespace glimmer
+         auto radius = (extent.GetHeight() * 0.5f) - (2.f * extra);
+         auto movement = extent.GetWidth() - (2.f * (radius + extra));
+         auto moveAmount = toggle.animate ? (io.deltaTime / specificStyle.animate) * movement * (state.checked ? 1.f : -1.f) : 0.f;
+-        toggle.progress += std::fabsf(moveAmount / movement);
++        toggle.progress += fabsf(moveAmount / movement);
+ 
+         auto center = toggle.btnpos == -1.f ? state.checked ? extent.Max - ImVec2{ extra + radius, extra + radius }
+             : extent.Min + ImVec2{ radius + extra, extra + radius }
+@@ -2294,7 +2294,7 @@ namespace glimmer
+ 
+     static ImRect SpinnerBounds(int32_t id, const SpinnerState& state, IRenderer& renderer, const ImRect& extent)
+     {
+-        auto digits = (int)(std::ceilf(std::log10f(state.max) + 1.f)) + (!state.isInteger ? state.precision + 1 : 0);
++        auto digits = (int)(ceilf(log10f(state.max) + 1.f)) + (!state.isInteger ? state.precision + 1 : 0);
+         auto& context = GetContext();
+         const auto style = context.GetStyle(state.state, state.id);
+ 
+@@ -3182,7 +3182,7 @@ namespace glimmer
+                 {
+                     auto posx = mousepos.x - content.Min.x;
+                     if (input.selectionStart == -1.f) input.selectionStart = posx;
+-                    else if ((std::fabsf(input.selectionStart - posx) > 5.f) || input.isSelecting)
++                    else if ((fabsf(input.selectionStart - posx) > 5.f) || input.isSelecting)
+                     {
+                         if (state.selection.first == -1)
+                         {
+@@ -3213,7 +3213,7 @@ namespace glimmer
+                             {
+                                 if ((prevpos < input.caretpos) && (input.pixelpos[input.caretpos - 1] - input.scroll.state.pos.x > content.GetWidth()))
+                                 {
+-                                    auto width = std::fabsf(input.pixelpos[input.caretpos - 1] - (input.caretpos > 1 ? input.pixelpos[input.caretpos - 2] : 0.f));
++                                    auto width = fabsf(input.pixelpos[input.caretpos - 1] - (input.caretpos > 1 ? input.pixelpos[input.caretpos - 2] : 0.f));
+                                     input.moveRight(width);
+                                 }
+                             }
+@@ -3221,7 +3221,7 @@ namespace glimmer
+                             {
+                                 if (prevpos > input.caretpos && (input.pixelpos[input.caretpos - 1] - input.scroll.state.pos.x < 0.f))
+                                 {
+-                                    auto width = std::fabsf(input.pixelpos[prevpos - 1] - (prevpos > 1 ? input.pixelpos[prevpos - 2] : 0.f));
++                                    auto width = fabsf(input.pixelpos[prevpos - 1] - (prevpos > 1 ? input.pixelpos[prevpos - 2] : 0.f));
+                                     input.moveLeft(width);
+                                 }
+                             }
+@@ -3236,7 +3236,7 @@ namespace glimmer
+                     auto posx = mousepos.x - content.Min.x;
+ 
+                     // This means we have clicked, not selecting text
+-                    if (std::fabsf(input.selectionStart - posx) < 5.f)
++                    if (fabsf(input.selectionStart - posx) < 5.f)
+                     {
+                         auto it = std::lower_bound(input.pixelpos.begin(), input.pixelpos.end(), posx + input.scroll.state.pos.x);
+                         auto idx = it - input.pixelpos.begin();
+@@ -3333,7 +3333,7 @@ namespace glimmer
+ 
+                             if (prevpos > input.caretpos && (input.pixelpos[input.caretpos - 1] - input.scroll.state.pos.x < 0.f))
+                             {
+-                                auto width = std::fabsf(input.pixelpos[prevpos - 1] - (prevpos > 1 ? input.pixelpos[prevpos - 2] : 0.f));
++                                auto width = fabsf(input.pixelpos[prevpos - 1] - (prevpos > 1 ? input.pixelpos[prevpos - 2] : 0.f));
+                                 input.moveLeft(width);
+                             }
+                         }
+@@ -3360,7 +3360,7 @@ namespace glimmer
+ 
+                             if ((prevpos < input.caretpos) && (input.pixelpos[input.caretpos - 1] - input.scroll.state.pos.x > content.GetWidth()))
+                             {
+-                                auto width = std::fabsf(input.pixelpos[input.caretpos - 1] - (input.caretpos > 1 ? input.pixelpos[input.caretpos - 2] : 0.f));
++                                auto width = fabsf(input.pixelpos[input.caretpos - 1] - (input.caretpos > 1 ? input.pixelpos[input.caretpos - 2] : 0.f));
+                                 input.moveRight(width);
+                             }
+                         }
+@@ -4790,7 +4790,7 @@ namespace glimmer
+             {
+                 ImVec2 center{ tab.pin.Min.x + (tab.pin.GetWidth() * 0.5f), tab.pin.Min.y +
+                     (tab.pin.GetHeight() * 0.5f) };
+-                auto radius = (1.f / std::sqrtf(2)) * tab.pin.GetWidth();
++                auto radius = (1.f / sqrtf(2)) * tab.pin.GetWidth();
+                 renderer.DrawCircle(center, radius, specificStyle.pinbgcolor, true);
+             }
+             else
+@@ -4808,7 +4808,7 @@ namespace glimmer
+             {
+                 ImVec2 center{ tab.close.Min.x + (tab.close.GetWidth() * 0.5f), tab.close.Min.y +
+                     (tab.close.GetHeight() * 0.5f) };
+-                auto radius = (1.f / std::sqrtf(2)) * tab.close.GetWidth();
++                auto radius = (1.f / sqrtf(2)) * tab.close.GetWidth();
+                 renderer.DrawCircle(center, radius, specificStyle.closebgcolor, true);
+             }
+             else

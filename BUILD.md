@@ -7,18 +7,23 @@ This document provides instructions for building the Glimmer library as a static
 ### Required Tools
 
 - **CMake** (version 3.15 or higher)
-- **GCC or Clang** compiler with C++20 support
+- **GCC 11+** or **Clang** compiler with C++20 support
 - **Make** or **Ninja** build system
+- **Git** (for cloning dependencies)
 
 Install on Ubuntu/Debian:
 ```bash
 sudo apt update
-sudo apt install cmake build-essential
+sudo apt install cmake build-essential git
 ```
 
-Install on Fedora/RHEL:
+Install on Fedora/RHEL/CentOS:
 ```bash
-sudo dnf install cmake gcc-c++ make
+sudo dnf install cmake gcc-c++ make git
+
+# For C++20 support on RHEL 8/CentOS 8, install GCC Toolset 11 or 12:
+sudo yum install gcc-toolset-12
+# The build scripts will automatically use it
 ```
 
 Install on Arch Linux:
@@ -26,26 +31,57 @@ Install on Arch Linux:
 sudo pacman -S cmake base-devel
 ```
 
-### Optional Dependencies
+### Required Dependencies
 
-For full functionality, you may need:
-- **FreeType** - Font rendering library
-- **OpenGL** - Graphics rendering
-- **GLFW3** - Window management (if using GLFW backend)
+Glimmer requires these static libraries (built automatically by `build_dependencies.sh`):
+- **libplutovg.a** - Vector graphics rendering
+- **liblunasvg.a** - SVG support
+- **libSDL3.a** - Platform/windowing (with X11 support)
+- **libfreetype.a** - Font rendering
+- **libimgui.a** - Immediate mode GUI framework
+- **libimplot.a** - Plotting support
+- **libyogacore.a** - Flexbox layout engine
+- **libblend2d.a** - 2D graphics rendering (optional)
 
-Install optional dependencies on Ubuntu/Debian:
+### System Dependencies
+
+For building the dependencies, you'll need X11 development libraries:
+
+Ubuntu/Debian:
 ```bash
-sudo apt install libfreetype6-dev libglfw3-dev libgl1-mesa-dev
+sudo apt install libx11-dev libxext-dev libxi-dev libxfixes-dev
 ```
 
-## Quick Build
+RHEL/CentOS (may already be installed):
+```bash
+sudo yum install libX11-devel libXext-devel libXi-devel libXfixes-devel
+```
 
-### Using the Build Script (Recommended)
+## Build Process
 
-The easiest way to build is using the provided build script:
+### Step 1: Build Dependencies (Required - First Time Only)
+
+Before building Glimmer, you must build the required static libraries:
 
 ```bash
-cd /home/saikat/glimmer
+cd /home/amd/glimmer
+./build_dependencies.sh
+```
+
+This will build 8 static libraries and place them in `src/libs/lib/linux/release/`.
+
+**Build dependencies in debug mode:**
+```bash
+./build_dependencies.sh --debug
+```
+
+**Note:** This step takes 10-20 minutes depending on your system. You only need to run this once, or when you want to switch between release/debug builds.
+
+### Step 2: Build Glimmer Library
+
+Once dependencies are built, build the Glimmer library:
+
+```bash
 ./build.sh
 ```
 
@@ -58,30 +94,41 @@ This will build the library in **Release** mode and create `libglimmer.a` in the
 
 Options:
   -h, --help              Show help message
-  -d, --debug             Build in Debug mode (default: Release)
+  -r, --release           Build in Release mode (optimized, default)
+  -d, --debug             Build in Debug mode (with debug symbols)
   -c, --clean             Clean build directory before building
   --no-svg                Disable SVG support
   --no-images             Disable image support
   --no-richtext           Disable rich text support
   --no-plots              Disable plots support
   --enable-nfdext         Enable nfd-extended library for file dialogs
+  --enable-blend2d        Enable Blend2D renderer
 ```
 
-### Examples
+### Build Examples
 
-Build in debug mode:
+**Release build (default):**
 ```bash
-./build.sh --debug
+./build.sh
+# or explicitly:
+./build.sh --release
 ```
 
-Clean build with SVG and images disabled:
+**Debug build:**
 ```bash
-./build.sh --clean --no-svg --no-images
+./build_dependencies.sh --debug   # Build debug dependencies first
+./build.sh --debug                # Build Glimmer in debug mode
 ```
 
-Build with file dialog support enabled:
+**Clean build:**
 ```bash
-./build.sh --enable-nfdext
+./build.sh --clean --release
+```
+
+**Custom feature configuration:**
+```bash
+./build.sh --no-svg --no-images   # Minimal build
+./build.sh --enable-blend2d       # With Blend2D renderer
 ```
 
 ## Manual Build with CMake
@@ -91,7 +138,7 @@ If you prefer to use CMake directly:
 ### 1. Create Build Directory
 
 ```bash
-cd /home/saikat/glimmer
+cd /home/amd/glimmer
 mkdir -p build
 cd build
 ```
@@ -150,6 +197,7 @@ This will install:
 | `GLIMMER_DISABLE_RICHTEXT` | OFF | Disable rich text rendering |
 | `GLIMMER_DISABLE_PLOTS` | OFF | Disable plotting/graph library integration |
 | `GLIMMER_ENABLE_NFDEXT` | OFF | Enable nfd-extended for native file dialogs |
+| `GLIMMER_ENABLE_BLEND2D` | OFF | Enable Blend2D renderer (requires libblend2d.a) |
 
 ## Output
 
@@ -168,34 +216,58 @@ In your project's CMakeLists.txt:
 
 ```cmake
 # Add Glimmer include directories
-include_directories(/home/saikat/glimmer)
-include_directories(/home/saikat/glimmer/src)
-include_directories(/home/saikat/glimmer/src/libs/inc)
+include_directories(/home/amd/glimmer)
+include_directories(/home/amd/glimmer/src)
+include_directories(/home/amd/glimmer/src/libs/inc)
 
-# Link against the static library
+# Link against the static library and all dependencies
 add_executable(myapp main.cpp)
+
+# Glimmer and its dependencies
+set(GLIMMER_LIB_DIR /home/amd/glimmer/src/libs/lib/linux/release)
 target_link_libraries(myapp 
-    /home/saikat/glimmer/staticlib/libglimmer.a
+    /home/amd/glimmer/staticlib/libglimmer.a
+    ${GLIMMER_LIB_DIR}/libimgui.a
+    ${GLIMMER_LIB_DIR}/libimplot.a
+    ${GLIMMER_LIB_DIR}/libyogacore.a
+    ${GLIMMER_LIB_DIR}/liblunasvg.a
+    ${GLIMMER_LIB_DIR}/libplutovg.a
+    ${GLIMMER_LIB_DIR}/libSDL3.a
+    ${GLIMMER_LIB_DIR}/libfreetype.a
+)
+
+# System libraries
+find_package(X11 REQUIRED)
+find_package(OpenGL REQUIRED)
+target_link_libraries(myapp 
+    ${X11_LIBRARIES}
+    OpenGL::GL
     pthread
     dl
     m
 )
-
-# If using OpenGL/GLFW
-find_package(OpenGL REQUIRED)
-find_package(glfw3 REQUIRED)
-target_link_libraries(myapp OpenGL::GL glfw)
 ```
 
 ### 2. Using with GCC/Clang Directly
 
 ```bash
+GLIMMER_DIR=/home/amd/glimmer
+LIB_DIR=$GLIMMER_DIR/src/libs/lib/linux/release
+
 g++ -std=c++20 main.cpp \
-    -I/home/saikat/glimmer \
-    -I/home/saikat/glimmer/src \
-    -I/home/saikat/glimmer/src/libs/inc \
-    -L/home/saikat/glimmer/staticlib \
-    -lglimmer -lpthread -ldl -lm \
+    -I$GLIMMER_DIR \
+    -I$GLIMMER_DIR/src \
+    -I$GLIMMER_DIR/src/libs/inc \
+    $GLIMMER_DIR/staticlib/libglimmer.a \
+    $LIB_DIR/libimgui.a \
+    $LIB_DIR/libimplot.a \
+    $LIB_DIR/libyogacore.a \
+    $LIB_DIR/liblunasvg.a \
+    $LIB_DIR/libplutovg.a \
+    $LIB_DIR/libSDL3.a \
+    $LIB_DIR/libfreetype.a \
+    -lX11 -lXext -lXi -lXfixes \
+    -lGL -lpthread -ldl -lm \
     -o myapp
 ```
 
@@ -257,20 +329,20 @@ make -j$(nproc)
 Check that the library was created:
 
 ```bash
-ls -lh /home/saikat/glimmer/staticlib/libglimmer.a
+ls -lh /home/amd/glimmer/staticlib/libglimmer.a
 ```
 
 Check symbols in the library:
 
 ```bash
-nm /home/saikat/glimmer/staticlib/libglimmer.a | grep glimmer
+nm /home/amd/glimmer/staticlib/libglimmer.a | grep glimmer
 ```
 
 Check library information:
 
 ```bash
-file /home/saikat/glimmer/staticlib/libglimmer.a
-ar -t /home/saikat/glimmer/staticlib/libglimmer.a
+file /home/amd/glimmer/staticlib/libglimmer.a
+ar -t /home/amd/glimmer/staticlib/libglimmer.a
 ```
 
 ## Platform Notes
@@ -287,8 +359,8 @@ The library is built with position-independent code (`-fPIC`) and links against 
 
 - See `README.md` for library usage and API documentation
 - See `GlimmerTest/test.cpp` for example code
-- Library source: `/home/saikat/glimmer/src/`
-- Dependencies: `/home/saikat/glimmer/src/libs/`
+- Library source: `/home/amd/glimmer/src/`
+- Dependencies: `/home/amd/glimmer/src/libs/`
 
 
 
