@@ -47,9 +47,6 @@ index 5cfaec2..cc444d7 100644
      {
          static ImGuiSDL3SoftwarePlatform platform;
          static bool initialized = false;
-diff --git a/build.sh b/build.sh
-old mode 100644
-new mode 100755
 diff --git a/src/layout.cpp b/src/layout.cpp
 index a67e015..63dc68e 100644
 --- a/src/layout.cpp
