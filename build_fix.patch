@@ -1,0 +1,153 @@
+diff --git a/GlimmerTest/GlimmerTestGLFW/platform.cpp b/GlimmerTest/GlimmerTestGLFW/platform.cpp
+index 3703c86..0b37107 100644
+--- a/GlimmerTest/GlimmerTestGLFW/platform.cpp
++++ b/GlimmerTest/GlimmerTestGLFW/platform.cpp
+@@ -215,9 +215,9 @@ namespace glimmer
+                 ImGui_ImplOpenGL3_NewFrame();
+                 ImGui_ImplGlfw_NewFrame();
+ 
+-                if (EnterFrame(width, height, CustomEventData{}))
++                if (EnterFrame(static_cast<float>(width), static_cast<float>(height), CustomEventData{}))
+                 {
+-                    close = !runner(ImVec2{ width, height }, *this, data);
++                    close = !runner(ImVec2{ static_cast<float>(width), static_cast<float>(height) }, *this, data);
+ 
+                     for (auto [data, handler] : handlers)
+                         close = !handler(data, desc) && close;
+diff --git a/GlimmerTest/GlimmerTestSDLSoftware/platform.cpp b/GlimmerTest/GlimmerTestSDLSoftware/platform.cpp
+index 5cfaec2..cc444d7 100644
+--- a/GlimmerTest/GlimmerTestSDLSoftware/platform.cpp
++++ b/GlimmerTest/GlimmerTestSDLSoftware/platform.cpp
+@@ -218,9 +218,9 @@ namespace glimmer
+                 ImGui_ImplSDLRenderer3_NewFrame();
+                 ImGui_ImplSDL3_NewFrame();
+ 
+-                if (EnterFrame(width, height, custom.empty() ? CustomEventData{} : custom.front()))
++                if (EnterFrame(static_cast<float>(width), static_cast<float>(height), custom.empty() ? CustomEventData{} : custom.front()))
+                 {
+-                    done = !runner(ImVec2{ width, height }, *this, data);
++                    done = !runner(ImVec2{ static_cast<float>(width), static_cast<float>(height) }, *this, data);
+ 
+                     for (auto [data, handler] : handlers)
+                         done = !handler(data, desc) && done;
+@@ -339,7 +339,6 @@ namespace glimmer
+                     sdlfilter.pattern = filters[idx].second.data();
+                 }
+ 
+-                auto allowMany = (target & MultipleFiles) != 0;
+                 auto allowMany = (target & MultipleFiles) != 0;
+                 auto pset = SDL_CreateProperties();
+                 SDL_SetPointerProperty(pset, SDL_PROP_FILE_DIALOG_FILTERS_POINTER, sdlfilters.data());
+@@ -401,7 +400,7 @@ namespace glimmer
+         std::deque<CustomEventData> custom;
+     };
+ 
+-    IPlatform* GetPlatform(ImVec2 size)
++    IPlatform* InitPlatform(ImVec2 size)
+     {
+         static ImGuiSDL3SoftwarePlatform platform;
+         static bool initialized = false;
+diff --git a/build.sh b/build.sh
+old mode 100644
+new mode 100755
+diff --git a/src/layout.cpp b/src/layout.cpp
+index a67e015..63dc68e 100644
+--- a/src/layout.cpp
++++ b/src/layout.cpp
+@@ -1836,7 +1836,7 @@ namespace glimmer
+         case WT_Custom: {
+             if (Config.customWidget != nullptr)
+             {
+-                const auto style = Config.customWidget->GetStyle(item.id, StyleStack);
++                const auto style = Config.customWidget->GetStyle(item.id, StyleStack[WSI_Default]);
+                 UpdateGeometry(item, bbox, style);
+ 
+                 if (render)
+diff --git a/src/platform.cpp b/src/platform.cpp
+index c96e3ff..2949f19 100644
+--- a/src/platform.cpp
++++ b/src/platform.cpp
+@@ -316,7 +316,7 @@ namespace glimmer
+ 
+     int32_t IPlatform::ShowFileDialog(std::span<char>* out, int32_t outsz, int32_t target,
+         std::string_view location, std::pair<std::string_view, std::string_view>* filters,
+-        int totalFilters, const DialogProperties* props)
++        int totalFilters, const DialogProperties& props)
+     {
+         assert(out != nullptr && outsz >= 1);
+         static Vector<nfdu8filteritem_t, int16_t, 16> filterItems{ false };
+@@ -400,7 +400,7 @@ namespace glimmer
+ 
+     int32_t IPlatform::ShowFileDialog(std::span<char>* out, int32_t outsz, int32_t target,
+         std::string_view location, std::pair<std::string_view, std::string_view>* filters,
+-        int totalFilters, const DialogProperties* props)
++        int totalFilters, const DialogProperties& props)
+     {
+         return 0;
+     }
+diff --git a/src/platform.h b/src/platform.h
+index edbcbb5..533df93 100644
+--- a/src/platform.h
++++ b/src/platform.h
+@@ -234,9 +234,9 @@ namespace glimmer
+ 
+         struct DialogProperties
+         {
+-            std::string_view title{};
+-            std::string_view confirmBtnText{"OK"};
+-            std::string_view cancelBtnText{"Cancel"};
++            std::string_view title;
++            std::string_view confirmBtnText;
++            std::string_view cancelBtnText;
+         };
+ 
+         friend int64_t FramesRendered();
+@@ -251,7 +251,7 @@ namespace glimmer
+         virtual void GetWindowHandle(void*);
+         virtual int32_t ShowFileDialog(std::span<char>* out, int32_t outsz, int32_t target,
+             std::string_view location, std::pair<std::string_view, std::string_view>* filters = nullptr,
+-            int totalFilters = 0, const DialogProperties* props = nullptr);
++            int totalFilters = 0, const DialogProperties& props = DialogProperties{});
+ 
+         virtual bool RegisterHotkey(const HotKeyEvent& hotkey);
+ 
+diff --git a/src/utils.h b/src/utils.h
+index 406152c..c7d9cb5 100644
+--- a/src/utils.h
++++ b/src/utils.h
+@@ -439,7 +439,8 @@ namespace glimmer
+         {
+         }
+ 
+-        template <typename Ty>
++        template <typename Ty,
++            typename = std::enable_if_t<!std::is_pointer_v<Ty>>>
+         DynamicStack(Ty param)
+             : _data{ param }
+         {
+diff --git a/src/widgets.cpp b/src/widgets.cpp
+index cecc8e5..6d36bbc 100644
+--- a/src/widgets.cpp
++++ b/src/widgets.cpp
+@@ -8594,7 +8594,7 @@ namespace glimmer
+         case WT_Custom: {
+             if (Config.customWidget != nullptr)
+             {
+-                const auto style = Config.customWidget->GetStyle(wid, WidgetContextData::StyleStack);
++                const auto style = Config.customWidget->GetStyle(wid, WidgetContextData::StyleStack[WSI_Default]);
+ 
+                 if (nestedCtx.source == NestedContextSourceType::Layout && !context.layoutStack.empty())
+                 {
+diff --git a/staticlib/glimmer/glimmer.vcxproj b/staticlib/glimmer/glimmer.vcxproj
+index a3b6a2c..ef06bba 100644
+--- a/staticlib/glimmer/glimmer.vcxproj
++++ b/staticlib/glimmer/glimmer.vcxproj
+@@ -200,7 +200,7 @@
+     <ClCompile>
+       <WarningLevel>TurnOffAllWarnings</WarningLevel>
+       <SDLCheck>true</SDLCheck>
+-      <PreprocessorDefinitions>_DEBUG;_LIB;IM_RICHTEXT_TARGET_IMGUI;LUNASVG_BUILD_STATIC;GLIMMER_ENABLE_ICON_FONT;GLIMMER_ENABLE_TESTING;BL_BUILD_OPT_AVX512;ASMJIT_NO_FOREIGN;ASMJIT_NO_STDCXX;ASMJIT_ABI_NAMESPACE=abi_bl;BL_STATIC;ASMJIT_STATIC;ASMJIT_NO_AARCH64;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <PreprocessorDefinitions>_DEBUG;_LIB;IM_RICHTEXT_TARGET_IMGUI;LUNASVG_BUILD_STATIC;GLIMMER_ENABLE_ICON_FONT;GLIMMER_ENABLE_TESTING;BL_BUILD_OPT_AVX512;ASMJIT_NO_FOREIGN;ASMJIT_NO_STDCXX;ASMJIT_ABI_NAMESPACE=abi_bl;BL_STATIC;ASMJIT_STATIC;ASMJIT_NO_AARCH64;GLIMMER_DISABLE_BLEND2D_RENDERER;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+       <ConformanceMode>true</ConformanceMode>
+       <PrecompiledHeader>NotUsing</PrecompiledHeader>
+       <PrecompiledHeaderFile>
