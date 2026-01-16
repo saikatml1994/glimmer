@@ -1,0 +1,4262 @@
+﻿#include "renderer.h"
+#include "context.h"
+#include "draw.h"
+#include "platform.h"
+
+#include <cstdio>
+#include <charconv>
+#include <limits>
+#include <algorithm>
+#include <deque>
+
+#ifndef GLIMMER_DISABLE_GIF
+#include <chrono>
+#endif
+
+#define _USE_MATH_DEFINES
+#include <math.h>
+
+#ifndef GLIMMER_DISABLE_SVG
+#include <libs/inc/lunasvg/lunasvg.h>
+#endif
+
+#include <style.h>
+
+#ifndef GLIMMER_DISABLE_IMAGES
+#define STB_IMAGE_IMPLEMENTATION
+#include <libs/inc/stb_image/stb_image.h>
+#endif
+
+#if GLIMMER_TARGET_PLATFORM == GLIMMER_PLATFORM_PDCURSES
+#include <curses.h>
+#include <panel.h>
+#endif
+
+#ifndef GLIMMER_DISABLE_BLEND2D_RENDERER
+#include <libs/inc/blend2d/blend2d.h>
+#endif
+
+#ifdef _WIN32
+#undef min
+#undef max
+#undef DrawText
+#endif
+
+// TODO: Test out pluto svg
+/*auto doc = plutosvg_document_load_from_data(buffer, csz, size.x, size.y, nullptr, nullptr);
+assert(doc != nullptr);
+
+plutovg_color_t col;
+auto [r, g, b, a] = DecomposeColor(color);
+plutovg_color_init_rgba8(&col, r, g, b, a);
+
+auto surface = plutosvg_document_render_to_surface(doc, nullptr, -1, -1, &col, nullptr, nullptr);
+auto pixels = plutovg_surface_get_data(surface);
+
+auto stride = plutovg_surface_get_stride(surface);
+auto width = plutovg_surface_get_width(surface), height = plutovg_surface_get_height(surface);
+plutovg_convert_argb_to_rgba(pixels, pixels, width, height, stride);*/
+
+namespace glimmer
+{
+    ImVec2& Round(ImVec2& v) { v.x = roundf(v.x); v.y = roundf(v.y); return v; };
+
+    ImVec2 ImGuiMeasureText(std::string_view text, void* fontptr, float sz, float wrapWidth)
+    {
+        auto imfont = (ImFont*)fontptr;
+        ImVec2 txtsz;
+
+        // Get the baked font data for the requested size
+        ImFontBaked* baked = imfont->GetFontBaked(sz);
+
+        if ((int)text.size() > 4 && wrapWidth == -1.f && IsFontMonospace(fontptr))
+            txtsz = ImVec2((float)text.size() * baked->IndexAdvanceX.Data[0], sz);
+        else
+        {
+            ImGui::PushFont(imfont);
+            txtsz = ImGui::CalcTextSize(text.data(), text.data() + text.size(), false, wrapWidth);
+            ImGui::PopFont();
+        }
+
+        auto ratio = (sz / baked->Size);
+        txtsz.x *= ratio;
+        txtsz.y *= ratio;
+        return txtsz;
+    }
+
+#ifndef GLIMMER_DISABLE_BLEND2D_RENDERER
+
+    ImVec2 Blend2DMeasureText(std::string_view text, void* fontptr, float sz, float wrapWidth)
+    {
+        auto font = static_cast<BLFont*>(fontptr);
+        if (!font)
+        {
+            return ImVec2{ (float)text.size() * sz, sz };
+        }
+
+        auto measureWithFont = [&](std::string_view s) -> ImVec2 {
+            if (s.empty()) return ImVec2{ 0.f, 0.f };
+            BLGlyphBuffer gb;
+            gb.set_utf8_text(s.data(), s.size());
+            font->shape(gb);
+            BLTextMetrics tm;
+            font->get_text_metrics(gb, tm);
+
+            float w = (float)(tm.bounding_box.x1 - tm.bounding_box.x0);
+            float h = (float)(tm.bounding_box.y1 - tm.bounding_box.y0);
+            if (h <= 0.0f)
+            {
+                auto fm = font->metrics();
+                h = (float)(fm.ascent - fm.descent + fm.line_gap);
+            }
+            return { w, h };
+        };
+
+        if (wrapWidth <= 0.f)
+        {
+            return measureWithFont(text);
+        }
+
+        // Word-wrapping: break into tokens (words + following whitespace) and accumulate line widths.
+        float maxLineWidth = 0.f;
+        float currentLineWidth = 0.f;
+        float maxTokenHeight = 0.f;
+        int lineCount = 0;
+        const char* ptr = text.data();
+        size_t len = text.size();
+        size_t i = 0;
+
+        while (i < len)
+        {
+            // find next word (non-space sequence)
+            size_t j = i;
+            while (j < len && !std::isspace((unsigned char)ptr[j])) ++j;
+            std::string_view word(ptr + i, j - i);
+
+            // measure the word
+            ImVec2 wordSz = measureWithFont(word);
+            // gather following whitespace (so spaces count towards width)
+            size_t k = j;
+            while (k < len && std::isspace((unsigned char)ptr[k])) ++k;
+            std::string_view spaces(ptr + j, k - j);
+            ImVec2 spacesSz = measureWithFont(spaces);
+
+            float segmentW = wordSz.x + spacesSz.x;
+            float segmentH = std::max(wordSz.y, spacesSz.y);
+            maxTokenHeight = std::max(maxTokenHeight, segmentH);
+
+            // If the segment doesn't fit on current line, wrap to next line (unless line empty)
+            if (currentLineWidth > 0.f && (currentLineWidth + segmentW) > wrapWidth)
+            {
+                maxLineWidth = std::max(maxLineWidth, currentLineWidth);
+                currentLineWidth = 0.f;
+                ++lineCount;
+            }
+
+            // If a single segment exceeds wrapWidth and current line is empty, still place it (no hyphenation)
+            currentLineWidth += segmentW;
+            i = k;
+        }
+
+        if (currentLineWidth > 0.f)
+        {
+            ++lineCount;
+            maxLineWidth = std::max(maxLineWidth, currentLineWidth);
+        }
+
+        if (lineCount == 0)
+        {
+            return ImVec2{ 0.f, 0.f };
+        }
+
+        float lineH = maxTokenHeight;
+        if (lineH <= 0.f)
+        {
+            auto fm = font->metrics();
+            lineH = (float)(fm.ascent - fm.descent + fm.line_gap);
+        }
+
+        return ImVec2{ maxLineWidth, lineH * (float)lineCount };
+    }
+
+#endif
+
+    struct FileContents
+    {
+        const char* data = nullptr;
+        int size = 0;
+        bool isStatic = true;
+    };
+
+    struct ImageData
+    {
+        int index = 0;
+        stbi_uc* pixels = nullptr;
+        int width = 0;
+        int height = 0;
+        std::unique_ptr<lunasvg::Document> svgmarkup;
+    };
+
+    static void FreeResource(FileContents& contents)
+    {
+        if (!contents.isStatic) std::free((char*)contents.data);
+        contents.data = nullptr;
+        contents.size = 0;
+    }
+
+    static FileContents GetResourceContents(int32_t resflags, std::string_view resource)
+    {
+        static thread_local char sbuffer[GLIMMER_MAX_STATIC_MEDIA_SZ];
+
+        if (resflags & RT_PATH)
+        {
+#ifdef _WIN32
+            FILE* fptr = nullptr;
+            fopen_s(&fptr, resource.data(), "r");
+#else
+            auto fptr = std::fopen(resource.data(), "r");
+#endif
+
+            if (fptr != nullptr)
+            {
+                std::fseek(fptr, 0, SEEK_END);
+                auto bufsz = (int)std::ftell(fptr);
+                std::fseek(fptr, 0, SEEK_SET);
+
+                if (bufsz >= GLIMMER_MAX_STATIC_MEDIA_SZ)
+                {
+                    auto buffer = (char*)malloc(bufsz + 1);
+                    memset(buffer, 0, bufsz + 1);
+                    assert(buffer != nullptr);
+                    auto csz = (int)std::fread(buffer, 1, bufsz, fptr);
+                    std::fclose(fptr);
+                    return FileContents{ buffer, bufsz, false };
+                }
+                else
+                {
+                    memset(sbuffer, 0, GLIMMER_MAX_STATIC_MEDIA_SZ);
+                    auto csz = (int)std::fread(sbuffer, 1, bufsz, fptr);
+                    std::fclose(fptr);
+                    return FileContents{ sbuffer, bufsz, true };
+                }
+            }
+            else
+                std::fprintf(stderr, "Unable to open %s file\n", resource.data());
+        }
+        else return FileContents{ resource.data(), (int)resource.size(), true };
+        return FileContents{};
+    }
+
+    static std::pair<int, int> ExtractFileContents(std::string_view path, Vector<char, int32_t, 4096>& buffer)
+    {
+#ifdef _WIN32
+        FILE* fptr = nullptr;
+        fopen_s(&fptr, path.data(), "r");
+#else
+        auto fptr = std::fopen(path.data(), "r");
+#endif
+
+        if (fptr != nullptr)
+        {
+            std::fseek(fptr, 0, SEEK_END);
+            auto bufsz = (int)std::ftell(fptr);
+            std::fseek(fptr, 0, SEEK_SET);
+
+            auto sz = buffer.size();
+            buffer.expand(bufsz);
+            std::fread(buffer.data() + sz, 1, bufsz, fptr);
+            std::fclose(fptr);
+            return { sz, sz + bufsz };
+        }
+        else
+            std::fprintf(stderr, "Unable to open %s file\n", path.data());
+
+        return { 0, 0 };
+    }
+
+#pragma region Deferred Renderer
+
+    enum class DrawingOps
+    {
+        Line, Triangle, Rectangle, RoundedRectangle, Circle, Sector,
+        RectGradient, RoundedRectGradient,
+        Polyline, Polygon, PolyGradient,
+        Text, Tooltip,
+        Resource,
+        PushClippingRect, PopClippingRect,
+        PushFont, PopFont
+    };
+
+    union DrawParams
+    {
+        struct {
+            ImVec2 start, end;
+            uint32_t color;
+            float thickness;
+        } line;
+
+        struct {
+            ImVec2 pos1, pos2, pos3;
+            uint32_t color;
+            float thickness;
+            bool filled;
+        } triangle;
+
+        struct {
+            ImVec2 start, end;
+            uint32_t color;
+            float thickness;
+            bool filled;
+        } rect;
+
+        struct {
+            ImVec2 start, end;
+            float topleftr, toprightr, bottomleftr, bottomrightr;
+            uint32_t color;
+            float thickness;
+            bool filled;
+        } roundedRect;
+
+        struct {
+            ImVec2 start, end;
+            uint32_t from, to;
+            Direction dir;
+        } rectGradient;
+
+        struct {
+            ImVec2 start, end;
+            float topleftr, toprightr, bottomleftr, bottomrightr;
+            uint32_t from, to;
+            Direction dir;
+        } roundedRectGradient;
+
+        struct {
+            ImVec2 center;
+            float radius;
+            uint32_t color;
+            float thickness;
+            bool filled;
+        } circle;
+
+        struct {
+            ImVec2 center;
+            float radius;
+            int start, end;
+            uint32_t color;
+            float thickness;
+            bool filled, inverted;
+        } sector;
+
+        struct {
+            std::string_view text;
+            ImVec2 pos;
+            uint32_t color;
+            float wrapWidth;
+        } text;
+
+        struct {
+            ImVec2 pos;
+            std::string_view text;
+        } tooltip;
+
+        struct {
+            ImVec2 start, end;
+            bool intersect;
+        } clippingRect;
+
+        struct {
+            void* fontptr;
+            float size;
+        } font;
+
+        struct {
+            int32_t resflags;
+            int32_t id;
+            ImVec2 pos, size;
+            uint32_t color;
+            std::string_view content;
+        } resource;
+
+        struct {
+            ImVec2* points;
+            int size;
+            uint32_t color;
+            float thickness;
+        } polyline;
+
+        struct {
+            ImVec2* points;
+            int size;
+            uint32_t color;
+            float thickness;
+            bool filled;
+        } polygon;
+
+        struct {
+            ImVec2* points;
+            uint32_t* color;
+            int size;
+        } polygradient;
+
+        DrawParams() {}
+    };
+
+    struct DeferredRenderer final : public IRenderer
+    {
+        Vector<std::pair<DrawingOps, DrawParams>, int32_t, 32> queue{ 32 };
+        ImVec2(*TextMeasure)(std::string_view text, void* fontptr, float sz, float wrapWidth);
+
+        DeferredRenderer(ImVec2(*tm)(std::string_view text, void* fontptr, float sz, float wrapWidth))
+            : TextMeasure{ tm } {
+        }
+
+        RendererType Type() const { return RendererType::Deferred; }
+
+        int TotalEnqueued() const override { return queue.size(); }
+
+        void Render(IRenderer& renderer, ImVec2 offset, int from, int to) override
+        {
+            auto prevdl = renderer.UserData;
+            renderer.UserData = ImGui::GetWindowDrawList();
+            to = to == -1 ? queue.size() : to;
+
+            for (auto idx = from; idx < to; ++idx)
+            {
+                const auto& entry = queue[idx];
+
+                switch (entry.first)
+                {
+                case DrawingOps::Line:
+                    renderer.DrawLine(entry.second.line.start + offset, entry.second.line.end + offset, entry.second.line.color,
+                        entry.second.line.thickness);
+                    break;
+
+                case DrawingOps::Triangle:
+                    renderer.DrawTriangle(entry.second.triangle.pos1 + offset, entry.second.triangle.pos2 + offset,
+                        entry.second.triangle.pos3 + offset, entry.second.triangle.color, entry.second.triangle.filled,
+                        entry.second.triangle.thickness);
+                    break;
+
+                case DrawingOps::Rectangle:
+                    renderer.DrawRect(entry.second.rect.start + offset, entry.second.rect.end + offset, entry.second.rect.color,
+                        entry.second.rect.filled, entry.second.rect.thickness);
+                    break;
+
+                case DrawingOps::RoundedRectangle:
+                    renderer.DrawRoundedRect(entry.second.roundedRect.start + offset, entry.second.roundedRect.end + offset, entry.second.roundedRect.color,
+                        entry.second.roundedRect.filled, entry.second.roundedRect.topleftr, entry.second.roundedRect.toprightr,
+                        entry.second.roundedRect.bottomrightr, entry.second.roundedRect.bottomleftr, entry.second.roundedRect.thickness);
+                    break;
+
+                case DrawingOps::Circle:
+                    renderer.DrawCircle(entry.second.circle.center + offset, entry.second.circle.radius, entry.second.circle.color,
+                        entry.second.circle.filled, entry.second.circle.thickness);
+                    break;
+
+                case DrawingOps::Sector:
+                    renderer.DrawSector(entry.second.sector.center + offset, entry.second.sector.radius, entry.second.sector.start, entry.second.sector.end,
+                        entry.second.sector.color, entry.second.sector.filled, entry.second.sector.inverted, entry.second.sector.thickness);
+                    break;
+
+                case DrawingOps::RectGradient:
+                    renderer.DrawRectGradient(entry.second.rectGradient.start + offset, entry.second.rectGradient.end + offset, entry.second.rectGradient.from,
+                        entry.second.rectGradient.to, entry.second.rectGradient.dir);
+                    break;
+
+                case DrawingOps::RoundedRectGradient:
+                    renderer.DrawRoundedRectGradient(entry.second.roundedRectGradient.start + offset, entry.second.roundedRectGradient.end + offset,
+                        entry.second.roundedRectGradient.topleftr, entry.second.roundedRectGradient.toprightr,
+                        entry.second.roundedRectGradient.bottomrightr, entry.second.roundedRectGradient.bottomleftr,
+                        entry.second.roundedRectGradient.from, entry.second.roundedRectGradient.to, entry.second.roundedRectGradient.dir);
+                    break;
+
+                case DrawingOps::Text:
+                    renderer.DrawText(entry.second.text.text, entry.second.text.pos + offset, entry.second.text.color, entry.second.text.wrapWidth);
+                    break;
+
+                case DrawingOps::Tooltip:
+                    renderer.DrawTooltip(entry.second.tooltip.pos + offset, entry.second.tooltip.text);
+                    break;
+
+                case DrawingOps::Resource:
+                    renderer.DrawResource(entry.second.resource.resflags, entry.second.resource.pos + offset,
+                        entry.second.resource.size, entry.second.resource.color, entry.second.resource.content,
+                        entry.second.resource.id);
+                    break;
+
+                case DrawingOps::PushClippingRect:
+                    renderer.SetClipRect(entry.second.clippingRect.start + offset, entry.second.clippingRect.end + offset,
+                        entry.second.clippingRect.intersect);
+                    break;
+
+                case DrawingOps::PopClippingRect:
+                    renderer.ResetClipRect();
+                    break;
+
+                case DrawingOps::PushFont:
+                    renderer.SetCurrentFont(entry.second.font.fontptr, entry.second.font.size);
+                    break;
+
+                case DrawingOps::PopFont:
+                    renderer.ResetFont();
+                    break;
+
+                case DrawingOps::Polyline:
+                    renderer.DrawPolyline(entry.second.polyline.points, entry.second.polyline.size,
+                        entry.second.polyline.color, entry.second.polyline.thickness);
+                    break;
+
+                case DrawingOps::Polygon:
+                    renderer.DrawPolygon(entry.second.polygon.points, entry.second.polygon.size,
+                        entry.second.polygon.color, entry.second.polygon.filled, entry.second.polygon.thickness);
+                    break;
+
+                case DrawingOps::PolyGradient:
+                    renderer.DrawPolyGradient(entry.second.polygradient.points, entry.second.polygradient.color,
+                        entry.second.polygradient.size);
+                    break;
+
+                default: break;
+                }
+            }
+
+            renderer.UserData = prevdl;
+        }
+
+        void Reset() { queue.clear(true); size = { 0.f, 0.f }; }
+
+        void SetClipRect(ImVec2 startpos, ImVec2 endpos, bool intersect)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::PushClippingRect;
+            val.second.clippingRect = { startpos, endpos, intersect };
+            size = ImMax(size, endpos);
+        }
+
+        void ResetClipRect() { auto& val = queue.emplace_back(); val.first = DrawingOps::PopClippingRect; }
+
+        void DrawLine(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness = 1.f)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::Line;
+            val.second.line = { startpos, endpos, color, thickness };
+            size = ImMax(size, endpos);
+        }
+
+        void DrawPolyline(ImVec2* points, int sz, uint32_t color, float thickness)
+        {
+            // TODO ...
+        }
+
+        void DrawTriangle(ImVec2 pos1, ImVec2 pos2, ImVec2 pos3, uint32_t color, bool filled, float thickness = 1.f)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::Triangle;
+            val.second.triangle = { pos1, pos2, pos3, color, thickness, filled };
+            size = ImMax(size, pos1);
+            size = ImMax(size, pos2);
+            size = ImMax(size, pos3);
+        }
+
+        void DrawRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float thickness = 1.f)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::Rectangle;
+            val.second.rect = { startpos, endpos, color, thickness, filled };
+            size = ImMax(size, endpos);
+        }
+
+        void DrawRoundedRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float topleftr, float toprightr,
+            float bottomrightr, float bottomleftr, float thickness = 1.f)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::RoundedRectangle;
+            val.second.roundedRect = { startpos, endpos, topleftr, toprightr, bottomleftr, bottomrightr, color, thickness, filled };
+            size = ImMax(size, endpos);
+        }
+
+        void DrawRectGradient(ImVec2 startpos, ImVec2 endpos, uint32_t colorfrom, uint32_t colorto, Direction dir)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::RectGradient;
+            val.second.rectGradient = { startpos, endpos, colorfrom, colorto, dir };
+            size = ImMax(size, endpos);
+        }
+
+        void DrawRoundedRectGradient(ImVec2 startpos, ImVec2 endpos, float topleftr, float toprightr, float bottomrightr,
+            float bottomleftr, uint32_t colorfrom, uint32_t colorto, Direction dir)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::RoundedRectGradient;
+            val.second.roundedRectGradient = { startpos, endpos, topleftr, toprightr, bottomleftr, bottomrightr, colorfrom, colorto, dir };
+            size = ImMax(size, endpos);
+        }
+
+        void DrawPolygon(ImVec2* points, int sz, uint32_t color, bool filled, float thickness = 1.f) {}
+
+        void DrawPolyGradient(ImVec2* points, uint32_t* colors, int sz) {}
+
+        void DrawCircle(ImVec2 center, float radius, uint32_t color, bool filled, float thickness = 1.f)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::Circle;
+            val.second.circle = { center, radius, color, thickness, filled };
+            size = ImMax(size, center + ImVec2{ radius, radius });
+        }
+
+        void DrawSector(ImVec2 center, float radius, int start, int end, uint32_t color, bool filled, bool inverted, float thickness = 1.f)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::Sector;
+            val.second.sector = { center, radius, start, end, color, thickness, filled, inverted };
+            size = ImMax(size, center + ImVec2{ radius, radius });
+        }
+
+        void DrawRadialGradient(ImVec2 center, float radius, uint32_t in, uint32_t out, int start, int end) {}
+
+        bool SetCurrentFont(std::string_view family, float sz, FontType type) override
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::PushFont;
+            val.second.font = { GetFont(family, sz, type), sz };
+            return true;
+        }
+
+        bool SetCurrentFont(void* fontptr, float sz) override
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::PushFont;
+            val.second.font = { fontptr, sz };
+            return true;
+        }
+
+        void ResetFont() override
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::PopFont;
+        }
+
+        ImVec2 GetTextSize(std::string_view text, void* fontptr, float sz, float wrapWidth = -1.f)
+        {
+            return TextMeasure(text, fontptr, sz, wrapWidth);
+        }
+
+        void DrawText(std::string_view text, ImVec2 pos, uint32_t color, float wrapWidth = -1.f)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::Text;
+            ::new (&val.second.text.text) std::string_view{ text };
+            val.second.text.color = color;
+            val.second.text.pos = pos;
+            val.second.text.wrapWidth = wrapWidth;
+            size = ImMax(size, pos);
+        }
+
+        void DrawTooltip(ImVec2 pos, std::string_view text)
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::Tooltip;
+            val.second.tooltip.pos = pos;
+            ::new (&val.second.tooltip.text) std::string_view{ text };
+        }
+
+        bool DrawResource(int32_t resflags, ImVec2 pos, ImVec2 size, uint32_t color, std::string_view content, int32_t id) override
+        {
+            auto& val = queue.emplace_back(); val.first = DrawingOps::Resource;
+            val.second.resource = { resflags, id, pos, size, color, content };
+            return true;
+        }
+    };
+
+#pragma endregion
+
+#pragma region ImGui Renderer
+
+    constexpr auto InvalidTextureId = std::numeric_limits<ImTextureID>::max();
+
+    struct ImGuiRenderer final : public IRenderer
+    {
+        ImGuiRenderer();
+
+        RendererType Type() const { return RendererType::ImGui; }
+        bool InitFrame(float width, float height, uint32_t bgcolor, bool softCursor) override;
+        void FinalizeFrame(int32_t cursor) override;
+
+        void SetClipRect(ImVec2 startpos, ImVec2 endpos, bool intersect);
+        void ResetClipRect();
+
+        void BeginDefer() override;
+        void EndDefer() override;
+
+        void DrawLine(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness = 1.f);
+        void DrawPolyline(ImVec2* points, int sz, uint32_t color, float thickness);
+        void DrawTriangle(ImVec2 pos1, ImVec2 pos2, ImVec2 pos3, uint32_t color, bool filled, float thickness = 1.f);
+        void DrawRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float thickness = 1.f);
+        void DrawRoundedRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float topleftr, float toprightr, float bottomrightr, float bottomleftr, float thickness = 1.f);
+        void DrawRectGradient(ImVec2 startpos, ImVec2 endpos, uint32_t colorfrom, uint32_t colorto, Direction dir);
+        void DrawRoundedRectGradient(ImVec2 startpos, ImVec2 endpos, float topleftr, float toprightr, float bottomrightr, float bottomleftr,
+            uint32_t colorfrom, uint32_t colorto, Direction dir);
+        void DrawPolygon(ImVec2* points, int sz, uint32_t color, bool filled, float thickness = 1.f);
+        void DrawPolyGradient(ImVec2* points, uint32_t* colors, int sz);
+        void DrawCircle(ImVec2 center, float radius, uint32_t color, bool filled, float thickness = 1.f);
+        void DrawSector(ImVec2 center, float radius, int start, int end, uint32_t color, bool filled, bool inverted, float thickness = 1.f);
+        void DrawRadialGradient(ImVec2 center, float radius, uint32_t in, uint32_t out, int start, int end);
+
+        bool SetCurrentFont(std::string_view family, float sz, FontType type) override;
+        bool SetCurrentFont(void* fontptr, float sz) override;
+        void ResetFont() override;
+        [[nodiscard]] ImVec2 GetTextSize(std::string_view text, void* fontptr, float sz, float wrapWidth);
+        void DrawText(std::string_view text, ImVec2 pos, uint32_t color, float wrapWidth = -1.f);
+        void DrawTooltip(ImVec2 pos, std::string_view text);
+        [[nodiscard]] float EllipsisWidth(void* fontptr, float sz) override;
+
+        bool StartOverlay(int32_t id, ImVec2 pos, ImVec2 size, uint32_t color) override;
+        void EndOverlay() override;
+
+        bool DrawResource(int32_t resflags, ImVec2 pos, ImVec2 size, uint32_t color, std::string_view content, int32_t id) override;
+        int64_t PreloadResources(int32_t loadflags, ResourceData* resources, int totalsz) override;
+
+        void DrawDebugRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness) override;
+
+    private:
+
+        void ConstructRoundedRect(ImVec2 startpos, ImVec2 endpos, float topleftr, float toprightr, float bottomrightr, float bottomleftr);
+
+        struct ImageLookupKey
+        {
+            int32_t id = -1;
+            std::pair<int, int> prefetched;
+            std::string data;
+            ImVec2 size{};
+            ImRect uvrect{ {0.f, 0.f}, {1.f, 1.f} };
+            bool hasCommonPrefetch = false;
+        };
+
+        struct GifLookupKey
+        {
+            int32_t id = -1;
+            int32_t currframe = 0;
+            int32_t totalframe = 0;
+            long long lastTime = 0;
+            ImVec2 size;
+            int* delays = nullptr;
+            std::pair<int, int> prefetched;
+            std::vector<ImRect> uvmaps;
+            std::string data;
+            bool hasCommonPrefetch = false;
+        };
+
+        struct DebugRect
+        {
+            ImVec2 startpos;
+            ImVec2 endpos;
+            uint32_t color;
+            float thickness;
+        };
+
+        void ExtractResourceData(const ResourceData& data, std::pair<int, int> range, const char* source,
+            bool hasCommonPrefetch, bool createTextAtlas, std::vector<ImageData>& indexes, int& totalwidth, int& maxheight);
+        int64_t RecordImage(std::pair<ImageLookupKey, ImTextureID>& entry, int32_t id, ImVec2 pos, ImVec2 size, stbi_uc* data, int bufsz, bool draw);
+        int64_t RecordGif(std::pair<GifLookupKey, ImTextureID>& entry, int32_t id, ImVec2 pos, ImVec2 size, stbi_uc* data, int bufsz, bool draw);
+        int64_t RecordSVG(std::pair<ImageLookupKey, ImTextureID>& entry, int32_t id, ImVec2 pos, ImVec2 size, uint32_t color, lunasvg::Document& document, bool draw);
+
+        float _currentFontSz = 0.f;
+        std::vector<std::pair<ImageLookupKey, ImTextureID>> bitmaps;
+        std::vector<std::pair<GifLookupKey, ImTextureID>> gifframes;
+        std::deque<std::pair<ImGuiWindow*, DeferredRenderer>> deferredContents;
+        std::vector<DebugRect> debugrects;
+        Vector<char, int32_t, 4096> prefetched; // All resource prefetched data is read into this
+        ImDrawList* prevlist = nullptr;
+
+#ifdef _DEBUG
+        int clipDepth = 0;
+#endif
+
+        bool deferDrawCalls = false;
+    };
+
+    ImGuiRenderer::ImGuiRenderer()
+    {}
+
+    bool ImGuiRenderer::InitFrame(float width, float height, uint32_t bgcolor, bool softCursor)
+    {
+        ImGui::NewFrame();
+        ImGui::GetIO().MouseDrawCursor = softCursor;
+
+        ImVec2 winsz{ (float)width, (float)height };
+        ImGui::SetNextWindowSize(winsz, ImGuiCond_Always);
+        ImGui::SetNextWindowPos(ImVec2{ 0, 0 });
+
+        if (ImGui::Begin(GLIMMER_IMGUI_MAINWINDOW_NAME, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings))
+        {
+            auto dl = ImGui::GetWindowDrawList();
+            Config.renderer->UserData = dl;
+            dl->AddRectFilled(ImVec2{ 0, 0 }, winsz, ImColor{ bgcolor });
+            return true;
+        }
+
+        return false;
+    }
+
+    void ImGuiRenderer::FinalizeFrame(int32_t cursor)
+    {
+        if (!deferredContents.empty())
+        {
+            auto& [dwindow, renderer] = deferredContents.back();
+            if (dwindow == ImGui::GetCurrentWindow())
+                renderer.Render(*this, {}, 0, -1);
+
+            deferredContents.clear();
+        }
+
+        for (const auto& rect : debugrects)
+            (ImGui::GetForegroundDrawList())->AddRect(
+                rect.startpos, rect.endpos, rect.color, 0.f, ImDrawFlags_None, rect.thickness);
+
+        ImGui::End();
+        ImGui::SetMouseCursor((ImGuiMouseCursor)cursor);
+        ImGui::Render();
+        debugrects.clear();
+    }
+
+    void ImGuiRenderer::SetClipRect(ImVec2 startpos, ImVec2 endpos, bool intersect)
+    {
+        Round(startpos); Round(endpos);
+        ImGui::PushClipRect(startpos, endpos, intersect);
+#ifdef _DEBUG
+        ++clipDepth;
+#endif
+    }
+
+    void ImGuiRenderer::ResetClipRect()
+    {
+        ImGui::PopClipRect();
+#ifdef _DEBUG
+        --clipDepth;
+#endif
+    }
+
+    void ImGuiRenderer::BeginDefer()
+    {
+        if (!deferDrawCalls)
+        {
+            deferDrawCalls = true;
+            auto window = ImGui::GetCurrentWindow();
+            deferredContents.emplace_back(window, 
+#ifndef GLIMMER_DISABLE_BLEND2D_RENDERER
+                Config.renderer->Type() == RendererType::ImGui ? &ImGuiMeasureText : &Blend2DMeasureText
+#else
+                &ImGuiMeasureText
+#endif
+            );
+        }
+    }
+
+    void ImGuiRenderer::EndDefer()
+    {
+        deferDrawCalls = false;
+    }
+
+    void ImGuiRenderer::DrawLine(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawLine(startpos, endpos, color, thickness);
+        else
+        {
+            Round(startpos); Round(endpos); thickness = roundf(thickness);
+            ((ImDrawList*)UserData)->AddLine(startpos, endpos, color, thickness);
+        }
+    }
+
+    void ImGuiRenderer::DrawPolyline(ImVec2* points, int sz, uint32_t color, float thickness)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawPolyline(points, sz, color, thickness);
+        else
+            ((ImDrawList*)UserData)->AddPolyline(points, sz, color, 0, thickness);
+    }
+
+    void ImGuiRenderer::DrawTriangle(ImVec2 pos1, ImVec2 pos2, ImVec2 pos3, uint32_t color, bool filled, float thickness)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawTriangle(pos1, pos2, pos3, color, filled, thickness);
+        else
+        {
+            Round(pos1); Round(pos2); Round(pos3); thickness = roundf(thickness);
+            filled ? ((ImDrawList*)UserData)->AddTriangleFilled(pos1, pos2, pos3, color) :
+                ((ImDrawList*)UserData)->AddTriangle(pos1, pos2, pos3, color, thickness);
+        }
+    }
+
+    void ImGuiRenderer::DrawRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float thickness)
+    {
+        if (thickness > 0.f || filled)
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawRect(startpos, endpos, color, filled, thickness);
+            else
+            {
+                Round(startpos); Round(endpos); thickness = roundf(thickness);
+                filled ? ((ImDrawList*)UserData)->AddRectFilled(startpos, endpos, color) :
+                    ((ImDrawList*)UserData)->AddRect(startpos, endpos, color, 0.f, 0, thickness);
+            }
+        }
+    }
+
+    void ImGuiRenderer::DrawRoundedRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled,
+        float topleftr, float toprightr, float bottomrightr, float bottomleftr, float thickness)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawRoundedRect(startpos, endpos, color, filled, topleftr, 
+                toprightr, bottomrightr, bottomleftr, thickness);
+        else
+        {
+            auto isUniformRadius = (topleftr == toprightr && toprightr == bottomrightr && bottomrightr == bottomleftr) ||
+                ((topleftr + toprightr + bottomrightr + bottomleftr) == 0.f);
+
+            Round(startpos); Round(endpos);
+            thickness = roundf(thickness);
+            topleftr = roundf(topleftr);
+            toprightr = roundf(toprightr);
+            bottomrightr = roundf(bottomrightr);
+            bottomleftr = roundf(bottomleftr);
+
+            if (isUniformRadius)
+            {
+                auto drawflags = 0;
+
+                if (topleftr > 0.f) drawflags |= ImDrawFlags_RoundCornersTopLeft;
+                if (toprightr > 0.f) drawflags |= ImDrawFlags_RoundCornersTopRight;
+                if (bottomrightr > 0.f) drawflags |= ImDrawFlags_RoundCornersBottomRight;
+                if (bottomleftr > 0.f) drawflags |= ImDrawFlags_RoundCornersBottomLeft;
+
+                filled ? ((ImDrawList*)UserData)->AddRectFilled(startpos, endpos, color, toprightr, drawflags) :
+                    ((ImDrawList*)UserData)->AddRect(startpos, endpos, color, toprightr, drawflags, thickness);
+            }
+            else
+            {
+                auto& dl = *((ImDrawList*)UserData);
+                ConstructRoundedRect(startpos, endpos, topleftr, toprightr, bottomrightr, bottomleftr);
+                filled ? dl.PathFillConvex(color) : dl.PathStroke(color, ImDrawFlags_Closed, thickness);
+            }
+        }
+    }
+
+    void ImGuiRenderer::DrawRectGradient(ImVec2 startpos, ImVec2 endpos, uint32_t colorfrom, uint32_t colorto, Direction dir)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawRectGradient(startpos, endpos, colorfrom, colorto, dir);
+        else
+        {
+            Round(startpos); Round(endpos);
+            dir == DIR_Horizontal ? ((ImDrawList*)UserData)->AddRectFilledMultiColor(startpos, endpos, colorfrom, colorto, colorto, colorfrom) :
+                ((ImDrawList*)UserData)->AddRectFilledMultiColor(startpos, endpos, colorfrom, colorfrom, colorto, colorto);
+        }
+    }
+
+    void ImGuiRenderer::DrawRoundedRectGradient(ImVec2 startpos, ImVec2 endpos, float topleftr, float toprightr, float bottomrightr, float bottomleftr, 
+        uint32_t colorfrom, uint32_t colorto, Direction dir)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawRoundedRectGradient(startpos, endpos, topleftr, toprightr, bottomrightr, bottomleftr, colorfrom, colorto, dir);
+        else
+        {
+            auto& dl = *((ImDrawList*)UserData);
+            ConstructRoundedRect(startpos, endpos, topleftr, toprightr, bottomrightr, bottomleftr);
+            // TODO: Create color array per vertex
+            DrawPolyGradient(dl._Path.Data, NULL, dl._Path.Size);
+        }
+    }
+
+    void ImGuiRenderer::DrawCircle(ImVec2 center, float radius, uint32_t color, bool filled, float thickness)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawCircle(center, radius, color, filled, thickness);
+        else
+        {
+            Round(center); radius = roundf(radius); thickness = roundf(thickness);
+            filled ? ((ImDrawList*)UserData)->AddCircleFilled(center, radius, color) :
+                ((ImDrawList*)UserData)->AddCircle(center, radius, color, 0, thickness);
+        }
+    }
+
+    void ImGuiRenderer::DrawSector(ImVec2 center, float radius, int start, int end, uint32_t color, bool filled, bool inverted, float thickness)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawSector(center, radius, start, end, color, filled, thickness);
+        else
+        {
+            constexpr float DegToRad = M_PI / 180.f;
+            Round(center); radius = roundf(radius); thickness = roundf(thickness);
+
+            if (inverted)
+            {
+                auto& dl = *((ImDrawList*)UserData);
+                dl.PathClear();
+                dl.PathArcTo(center, radius, DegToRad * (float)start, DegToRad * (float)end, 32);
+                auto start = dl._Path.front(), end = dl._Path.back();
+
+                ImVec2 exterior[4] = { { std::min(start.x, end.x), std::min(start.y, end.y) },
+                    { std::max(start.x, end.x), std::min(start.y, end.y) },
+                    { std::min(start.x, end.x), std::max(start.y, end.y) },
+                    { std::max(start.x, end.x), std::max(start.y, end.y) }
+                };
+
+                auto maxDistIdx = 0;
+                float dist = 0.f;
+                for (auto idx = 0; idx < 4; ++idx)
+                {
+                    auto curr = sqrt((end.x - start.x) * (end.x - start.x) +
+                        (end.y - start.y) * (end.y - start.y));
+                    if (curr > dist)
+                    {
+                        dist = curr;
+                        maxDistIdx = idx;
+                    }
+                }
+
+                dl.PathLineTo(exterior[maxDistIdx]);
+                filled ? dl.PathFillConcave(color) : dl.PathStroke(color, ImDrawFlags_Closed, thickness);
+            }
+            else
+            {
+                auto& dl = *((ImDrawList*)UserData);
+                dl.PathClear();
+                dl.PathArcTo(center, radius, DegToRad * (float)start, DegToRad * (float)end, 32);
+                dl.PathLineTo(center);
+                filled ? dl.PathFillConcave(color) : dl.PathStroke(color, ImDrawFlags_Closed, thickness);
+            }
+        }
+    }
+
+    void ImGuiRenderer::DrawPolygon(ImVec2* points, int sz, uint32_t color, bool filled, float thickness)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawPolygon(points, sz, color, filled, thickness);
+        else
+            filled ? ((ImDrawList*)UserData)->AddConvexPolyFilled(points, sz, color) :
+                ((ImDrawList*)UserData)->AddPolyline(points, sz, color, ImDrawFlags_Closed, thickness);
+    }
+
+    void ImGuiRenderer::DrawPolyGradient(ImVec2* points, uint32_t* colors, int sz)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawPolyGradient(points, colors, sz);
+        else
+        {
+            auto drawList = ((ImDrawList*)UserData);
+            const ImVec2 uv = drawList->_Data->TexUvWhitePixel;
+
+            if (drawList->Flags & ImDrawListFlags_AntiAliasedFill)
+            {
+                // Anti-aliased Fill
+                const float AA_SIZE = 1.0f;
+                const int idx_count = (sz - 2) * 3 + sz * 6;
+                const int vtx_count = (sz * 2);
+                drawList->PrimReserve(idx_count, vtx_count);
+
+                // Add indexes for fill
+                unsigned int vtx_inner_idx = drawList->_VtxCurrentIdx;
+                unsigned int vtx_outer_idx = drawList->_VtxCurrentIdx + 1;
+                for (int i = 2; i < sz; i++)
+                {
+                    drawList->_IdxWritePtr[0] = (ImDrawIdx)(vtx_inner_idx);
+                    drawList->_IdxWritePtr[1] = (ImDrawIdx)(vtx_inner_idx + ((i - 1) << 1));
+                    drawList->_IdxWritePtr[2] = (ImDrawIdx)(vtx_inner_idx + (i << 1));
+                    drawList->_IdxWritePtr += 3;
+                }
+
+                // Compute normals
+                ImVec2* temp_normals = (ImVec2*)alloca(sz * sizeof(ImVec2));
+                for (int i0 = sz - 1, i1 = 0; i1 < sz; i0 = i1++)
+                {
+                    const ImVec2& p0 = points[i0];
+                    const ImVec2& p1 = points[i1];
+                    ImVec2 diff = p1 - p0;
+                    diff *= ImInvLength(diff, 1.0f);
+                    temp_normals[i0].x = diff.y;
+                    temp_normals[i0].y = -diff.x;
+                }
+
+                for (int i0 = sz - 1, i1 = 0; i1 < sz; i0 = i1++)
+                {
+                    // Average normals
+                    const ImVec2& n0 = temp_normals[i0];
+                    const ImVec2& n1 = temp_normals[i1];
+                    ImVec2 dm = (n0 + n1) * 0.5f;
+                    float dmr2 = dm.x * dm.x + dm.y * dm.y;
+                    if (dmr2 > 0.000001f)
+                    {
+                        float scale = 1.0f / dmr2;
+                        if (scale > 100.0f) scale = 100.0f;
+                        dm *= scale;
+                    }
+                    dm *= AA_SIZE * 0.5f;
+
+                    // Add vertices
+                    drawList->_VtxWritePtr[0].pos = (points[i1] - dm);
+                    drawList->_VtxWritePtr[0].uv = uv; drawList->_VtxWritePtr[0].col = colors[i1];        // Inner
+                    drawList->_VtxWritePtr[1].pos = (points[i1] + dm);
+                    drawList->_VtxWritePtr[1].uv = uv; drawList->_VtxWritePtr[1].col = colors[i1] & ~IM_COL32_A_MASK;  // Outer
+                    drawList->_VtxWritePtr += 2;
+
+                    // Add indexes for fringes
+                    drawList->_IdxWritePtr[0] = (ImDrawIdx)(vtx_inner_idx + (i1 << 1));
+                    drawList->_IdxWritePtr[1] = (ImDrawIdx)(vtx_inner_idx + (i0 << 1));
+                    drawList->_IdxWritePtr[2] = (ImDrawIdx)(vtx_outer_idx + (i0 << 1));
+                    drawList->_IdxWritePtr[3] = (ImDrawIdx)(vtx_outer_idx + (i0 << 1));
+                    drawList->_IdxWritePtr[4] = (ImDrawIdx)(vtx_outer_idx + (i1 << 1));
+                    drawList->_IdxWritePtr[5] = (ImDrawIdx)(vtx_inner_idx + (i1 << 1));
+                    drawList->_IdxWritePtr += 6;
+                }
+
+                drawList->_VtxCurrentIdx += (ImDrawIdx)vtx_count;
+            }
+            else
+            {
+                // Non Anti-aliased Fill
+                const int idx_count = (sz - 2) * 3;
+                const int vtx_count = sz;
+                drawList->PrimReserve(idx_count, vtx_count);
+                for (int i = 0; i < vtx_count; i++)
+                {
+                    drawList->_VtxWritePtr[0].pos = points[i];
+                    drawList->_VtxWritePtr[0].uv = uv;
+                    drawList->_VtxWritePtr[0].col = colors[i];
+                    drawList->_VtxWritePtr++;
+                }
+                for (int i = 2; i < sz; i++)
+                {
+                    drawList->_IdxWritePtr[0] = (ImDrawIdx)(drawList->_VtxCurrentIdx);
+                    drawList->_IdxWritePtr[1] = (ImDrawIdx)(drawList->_VtxCurrentIdx + i - 1);
+                    drawList->_IdxWritePtr[2] = (ImDrawIdx)(drawList->_VtxCurrentIdx + i);
+                    drawList->_IdxWritePtr += 3;
+                }
+
+                drawList->_VtxCurrentIdx += (ImDrawIdx)vtx_count;
+            }
+
+            drawList->_Path.Size = 0;
+        }
+    }
+
+    void ImGuiRenderer::DrawRadialGradient(ImVec2 center, float radius, uint32_t in, uint32_t out, int start, int end)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawRadialGradient(center, radius, in, out, start, end);
+        else
+        {
+            Round(center); radius = roundf(radius);
+
+            auto drawList = ((ImDrawList*)UserData);
+            if (((in | out) & IM_COL32_A_MASK) == 0 || radius < 0.5f)
+                return;
+            auto startrad = ((float)M_PI / 180.f) * (float)start;
+            auto endrad = ((float)M_PI / 180.f) * (float)end;
+
+            // Use arc with 32 segment count
+            drawList->PathArcTo(center, radius, startrad, endrad, 32);
+            const int count = drawList->_Path.Size - 1;
+
+            unsigned int vtx_base = drawList->_VtxCurrentIdx;
+            drawList->PrimReserve(count * 3, count + 1);
+
+            // Submit vertices
+            const ImVec2 uv = drawList->_Data->TexUvWhitePixel;
+            drawList->PrimWriteVtx(center, uv, in);
+            for (int n = 0; n < count; n++)
+                drawList->PrimWriteVtx(drawList->_Path[n], uv, out);
+
+            // Submit a fan of triangles
+            for (int n = 0; n < count; n++)
+            {
+                drawList->PrimWriteIdx((ImDrawIdx)(vtx_base));
+                drawList->PrimWriteIdx((ImDrawIdx)(vtx_base + 1 + n));
+                drawList->PrimWriteIdx((ImDrawIdx)(vtx_base + 1 + ((n + 1) % count)));
+            }
+
+            drawList->_Path.Size = 0;
+        }
+    }
+
+    bool ImGuiRenderer::SetCurrentFont(std::string_view family, float sz, FontType type)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.SetCurrentFont(family, sz, type);
+        else
+        {
+            auto font = GetFont(family, sz, type);
+
+            if (font != nullptr)
+            {
+                _currentFontSz = sz;
+                ImGui::PushFont((ImFont*)font);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool ImGuiRenderer::SetCurrentFont(void* fontptr, float sz)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.SetCurrentFont(fontptr, sz);
+        else
+        {
+            if (fontptr != nullptr)
+            {
+                _currentFontSz = sz;
+                ImGui::PushFont((ImFont*)fontptr);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void ImGuiRenderer::ResetFont()
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.ResetFont();
+        else
+            ImGui::PopFont();
+    }
+
+    ImVec2 ImGuiRenderer::GetTextSize(std::string_view text, void* fontptr, float sz, float wrapWidth)
+    {
+        return ImGuiMeasureText(text, fontptr, sz, wrapWidth);
+    }
+
+    void ImGuiRenderer::DrawText(std::string_view text, ImVec2 pos, uint32_t color, float wrapWidth)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawText(text, pos, color, wrapWidth);
+        else
+        {
+            Round(pos);
+            auto font = ImGui::GetFont();
+            ((ImDrawList*)UserData)->AddText(font, _currentFontSz, pos, color, text.data(), text.data() + text.size(),
+                wrapWidth);
+        }
+    }
+
+    void ImGuiRenderer::DrawTooltip(ImVec2 pos, std::string_view text)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawTooltip(pos, text);
+        else
+        {
+            if (!text.empty())
+            {
+                SetCurrentFont(Config.tooltipFontFamily, Config.defaultFontSz, FT_Normal);
+                ImGui::SetTooltip("%.*s", (int)text.size(), text.data());
+                ResetFont();
+            }
+        }
+    }
+
+    float ImGuiRenderer::EllipsisWidth(void* fontptr, float sz)
+    {
+        ImFont* font = (ImFont*)fontptr;
+        ImFontBaked* baked = font->GetFontBaked(sz);
+        ImFontGlyph* glyph = baked->FindGlyph(font->EllipsisChar);
+        return glyph ? glyph->AdvanceX : 0.0f;
+    }
+
+    bool ImGuiRenderer::StartOverlay(int32_t id, ImVec2 pos, ImVec2 size, uint32_t color)
+    {
+        Round(pos); Round(size);
+
+        char buffer[32];
+        memset(buffer, 0, 32);
+        std::to_chars(buffer, buffer + 31, id);
+
+        ImGui::SetNextWindowPos(pos);
+        ImGui::SetNextWindowSize(size);
+
+        auto res = ImGui::Begin(buffer, nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings);
+        if (res)
+        {
+            auto dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(pos, pos + size, color);
+            prevlist = (ImDrawList*)UserData;
+            UserData = dl;
+            SetClipRect(pos, pos + size, false);
+        }
+        return res;
+    }
+
+    void ImGuiRenderer::EndOverlay()
+    {
+        auto window = ImGui::GetCurrentWindow();
+
+        if (!deferredContents.empty())
+        {
+            auto& [dwindow, renderer] = deferredContents.back();
+            if (dwindow == window)
+            {
+                renderer.Render(*this, {}, 0, -1);
+                deferredContents.pop_back();
+            }
+        }
+
+        ResetClipRect();
+        ImGui::End();
+        UserData = prevlist;
+        prevlist = nullptr;
+    }
+
+    template <typename KeyT>
+    static bool MatchKey(KeyT key, int32_t id, std::string_view content)
+    {
+        return key.id == -1 || id == -1 ? key.data == content : key.id == id;
+    }
+
+    bool ImGuiRenderer::DrawResource(int32_t resflags, ImVec2 pos, ImVec2 size, uint32_t color, std::string_view content, int32_t id)
+    {
+        if (deferDrawCalls) [[likely]]
+            deferredContents.back().second.DrawResource(resflags, pos, size, color, content, id);
+        else
+        {
+            auto fromFile = (resflags & RT_PATH) != 0;
+
+            if (resflags & RT_SYMBOL)
+            {
+                Round(pos); Round(size);
+                auto icon = GetSymbolIcon(content);
+                DrawSymbol(pos, size, { 0.f, 0.f }, icon, color, color, 1.f, *this);
+            }
+            else if (resflags & RT_ICON_FONT)
+            {
+#ifdef GLIMMER_ENABLE_ICON_FONT
+                Round(pos); Round(size);
+                SetCurrentFont(Config.iconFont, _currentFontSz);
+                DrawText(content, pos, color);
+                ResetFont();
+#else
+                assert(false);
+#endif
+            }
+            else if (resflags & RT_SVG)
+            {
+#ifndef GLIMMER_DISABLE_SVG
+                Round(pos); Round(size);
+                auto& dl = *((ImDrawList*)UserData);
+                bool found = false;
+
+                for (auto& entry : bitmaps)
+                {
+                    auto& [key, texid] = entry;
+                    if (MatchKey(key, id, content) && (key.size == size))
+                    {
+                        if (key.prefetched.second > key.prefetched.first)
+                        {
+                            auto document = lunasvg::Document::loadFromData(prefetched.data() + key.prefetched.first,
+                                key.prefetched.second - key.prefetched.first);
+                            if (document)
+                                RecordSVG(entry, id, pos, size, color, *document, false);
+                            else
+                                std::fprintf(stderr, "Failed to load SVG [%.*s]\n",
+                                    key.prefetched.second - key.prefetched.first,
+                                    prefetched.data() + key.prefetched.first);
+                            key.prefetched.second = key.prefetched.first = 0;
+                        }
+
+                        if (texid != InvalidTextureId)
+                            dl.AddImage(texid, pos, pos + size, key.uvrect.Min, key.uvrect.Max);
+
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found)
+                {
+                    auto contents = GetResourceContents(resflags, content);
+                    if (contents.size > 0)
+                    {
+                        auto document = lunasvg::Document::loadFromData(contents.data, contents.size);
+                        if (document)
+                            RecordSVG(bitmaps.emplace_back(), id, pos, size, color, *document, true);
+                        else
+                            std::fprintf(stderr, "Failed to load SVG [%s]\n", contents.data);
+                    }
+                    FreeResource(contents);
+                }
+#else
+                assert(false); // Unsupported
+#endif
+            }
+            else if ((resflags & RT_PNG) || (resflags & RT_JPG) || (resflags & RT_BMP) || (resflags & RT_PSD) ||
+                (resflags & RT_GENERIC_IMG))
+            {
+#ifndef GLIMMER_DISABLE_IMAGES
+                Round(pos); Round(size);
+
+                auto& dl = *((ImDrawList*)UserData);
+                bool found = false;
+
+                for (auto& entry : bitmaps)
+                {
+                    auto& [key, texid] = entry;
+                    if (MatchKey(key, id, content))
+                    {
+                        if (key.prefetched.second > key.prefetched.first)
+                        {
+                            auto data = prefetched.data() + key.prefetched.first;
+                            auto sz = key.prefetched.second - key.prefetched.first;
+                            RecordImage(entry, id, pos, size, (stbi_uc*)data, sz, false);
+                            key.prefetched.second = key.prefetched.first = 0;
+                        }
+
+                        if (texid != InvalidTextureId)
+                            dl.AddImage(texid, pos, pos + size, key.uvrect.Min, key.uvrect.Max);
+
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found)
+                {
+                    auto contents = GetResourceContents(resflags, content);
+                    if (contents.size > 0)
+                        RecordImage(bitmaps.emplace_back(), id, pos, size,
+                            (stbi_uc*)contents.data, (int)contents.size, true);
+                    FreeResource(contents);
+                }
+#else
+                assert(false); // Unsupported
+#endif
+            }
+            else if (resflags & RT_GIF)
+            {
+#ifndef GLIMMER_DISABLE_GIF
+                using namespace std::chrono;
+                Round(pos); Round(size);
+
+                auto& dl = *((ImDrawList*)UserData);
+                bool found = false;
+
+                for (auto& entry : gifframes)
+                {
+                    auto& [key, texid] = entry;
+                    if (MatchKey(key, id, content))
+                    {
+                        if (key.prefetched.second > key.prefetched.first)
+                        {
+                            auto data = prefetched.data() + key.prefetched.first;
+                            auto sz = key.prefetched.second - key.prefetched.first;
+                            RecordGif(entry, id, pos, size, (stbi_uc*)data, sz, false);
+                            key.prefetched.second = key.prefetched.first = 0;
+                        }
+
+                        if (texid != InvalidTextureId)
+                        {
+                            auto currts = system_clock::now().time_since_epoch();
+                            auto ms = duration_cast<milliseconds>(currts).count();
+                            if (key.delays[key.currframe] <= (ms - key.lastTime))
+                            {
+                                key.currframe = (key.currframe + 1) % key.totalframe;
+                                key.lastTime = ms;
+                            }
+
+                            auto uvrect = key.uvmaps[key.currframe];
+                            dl.AddImage(texid, pos, pos + size, uvrect.Min, uvrect.Max);
+                        }
+
+                        found = true;
+                        break;
+                    }
+                }
+
+                if (!found)
+                {
+                    auto contents = GetResourceContents(resflags, content);
+                    if (contents.size > 0)
+                        RecordGif(gifframes.emplace_back(), id, pos, size,
+                            (stbi_uc*)contents.data, (int)contents.size, true);
+                    FreeResource(contents);
+                }
+#else
+                assert(false); // Unsupported
+#endif
+            }
+        }
+
+        // TODO: return correct status
+        return true;
+    }
+
+    void ImGuiRenderer::ExtractResourceData(const ResourceData& data, std::pair<int, int> range,
+        const char* source, bool hasCommonPrefetch, bool createTexAtlas, std::vector<ImageData>& indexes, int& totalwidth, int& maxheight)
+    {
+        auto [id, resflags, bgcolor, content, sizes, count] = data;
+
+        if (range.second > range.first)
+        {
+            if (resflags & RT_GIF)
+            {
+                auto& data = gifframes.emplace_back();
+                data.first.prefetched = range;
+                data.first.data = content;
+                data.first.hasCommonPrefetch = hasCommonPrefetch;
+                indexes.emplace_back((int)gifframes.size() - 1);
+            }
+            else
+            {
+                assert(count > 0 || (resflags & RT_SVG == 0));
+
+                if (!(resflags & RT_SVG))
+                {
+                    auto& data = bitmaps.emplace_back().first;
+                    data.data = content;
+                    data.prefetched = range;
+                    data.id = id;
+                    data.hasCommonPrefetch = hasCommonPrefetch;
+
+                    auto& imgdata = indexes.emplace_back((int)bitmaps.size() - 1);
+
+                    if (createTexAtlas)
+                    {
+                        imgdata.pixels = stbi_load_from_memory((stbi_uc*)source + range.first,
+                            range.second - range.first,
+                            &imgdata.width, &imgdata.height, NULL, 4);
+                        maxheight = std::max(maxheight, imgdata.height);
+                        totalwidth += imgdata.width;
+                    }
+                }
+                else
+                {
+                    auto& svgdata = indexes.emplace_back((int)bitmaps.size());
+                    svgdata.svgmarkup = lunasvg::Document::loadFromData(source + range.first,
+                        range.second - range.first);
+
+                    for (auto sz = 0; sz < count; ++sz)
+                    {
+                        auto& data = bitmaps.emplace_back().first;
+                        data.data = content;
+                        data.prefetched = range;
+                        data.id = id;
+                        data.size = ImVec2{ (float)sizes[sz].x, (float)sizes[sz].y };
+                        data.hasCommonPrefetch = hasCommonPrefetch;
+
+                        if (createTexAtlas)
+                        {
+                            maxheight = std::max(maxheight, sizes[sz].y);
+                            totalwidth += sizes[sz].x;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    int64_t ImGuiRenderer::PreloadResources(int32_t loadflags, ResourceData* resources, int totalsz)
+    {
+        // NOTE: The atlas generation code can be improved by better rect-bin packing algorithm
+        // Current implementation works, but is suboptimal in terms to pixel data consumed.
+
+        int64_t totalBytes = 0;
+        auto createTexAtlas = (loadflags & LF_TextureAtlas) && (loadflags & LF_CreateTexture);
+        auto pixelbufsz = 0, maxheight = 0, totalwidth = 0;
+        auto bmstart = (int)bitmaps.size();
+        std::vector<ImageData> indexes;
+        indexes.reserve(totalsz);
+
+        // Load file contents in memory and determine texture atlas size
+        for (auto idx = 0; idx < totalsz; ++idx)
+        {
+            if (resources[idx].resflags & RT_PATH)
+            {
+                auto range = ExtractFileContents(resources[idx].content, prefetched);
+                ExtractResourceData(resources[idx], range, prefetched.data(), 
+                    true, createTexAtlas, indexes, totalwidth, maxheight);
+                totalBytes += (range.second - range.first);
+            }
+            else
+            {
+                auto range = std::make_pair(0, (int)resources[idx].content.size());
+                ExtractResourceData(resources[idx], range, resources[idx].content.data(), 
+                    false, createTexAtlas, indexes, totalwidth, maxheight);
+                totalBytes += (int)resources[idx].content.size();
+            }
+        }
+
+        pixelbufsz = totalwidth * maxheight * 4;
+        auto pixelbuf = createTexAtlas ? (stbi_uc*)malloc(pixelbufsz) : nullptr;
+        auto relw = 1.f / (float)totalwidth, currx = 0.f;
+        
+        // Load pixelbuf with pixel data for images/SVG, create textures for GIF
+        for (auto idx = 0; idx < totalsz; ++idx)
+        {
+            auto [id, resflags, bgcolor, content, sizes, count] = resources[idx];
+
+            if (resflags & RT_GIF)
+            {
+                if (loadflags & LF_CreateTexture)
+                {
+                    auto& entry = gifframes[indexes[idx].index];
+                    auto range = entry.first.prefetched;
+                    auto source = entry.first.hasCommonPrefetch ? (stbi_uc*)prefetched.data() : 
+                        (stbi_uc*)entry.first.data.data();
+                    RecordGif(entry, id, {}, {}, source + range.first, range.second - range.first, false);
+                }
+            }
+            else
+            {
+                if (loadflags & LF_CreateTexture)
+                {
+                    if (loadflags & LF_TextureAtlas)
+                    {
+                        if ((resflags & RT_SVG) && indexes[idx].svgmarkup)
+                        {
+                            auto midx = indexes[idx].index;
+                            for (auto szidx = 0; szidx < count; ++szidx, ++midx)
+                            {
+                                auto& entry = bitmaps[midx];
+                                auto pixels = indexes[idx].svgmarkup->renderToBitmap(
+                                    sizes[szidx].x, sizes[szidx].y, bgcolor);
+                                pixels.convertToRGBA();
+
+                                auto totalsz = sizes[szidx].x * sizes[szidx].y * 4;
+                                memcpy(pixelbuf, pixels.data(), totalsz);
+                                entry.first.uvrect = ImRect{ { currx, 0.f }, { currx + relw, 
+                                    (float)sizes[szidx].y / (float)maxheight } };
+                                pixelbuf += totalsz;
+                                currx += relw;
+                            }
+                        }
+                        else if ((resflags & RT_PNG) || (resflags & RT_JPG) || (resflags & RT_BMP) || (resflags & RT_PSD) ||
+                            (resflags & RT_GENERIC_IMG))
+                        {
+                            auto& entry = bitmaps[indexes[idx].index];
+                            auto& imgdata = indexes[idx];
+                            auto totalsz = imgdata.width * imgdata.height * 4;
+                            memcpy(pixelbuf, imgdata.pixels, totalsz);
+                            entry.first.uvrect = ImRect{ { currx, 0.f }, { currx + relw,
+                                    (float)imgdata.height / (float)maxheight } };
+                            pixelbuf += totalsz;
+                            currx += relw;
+                        }
+                    }
+                    else
+                    {
+                        if ((resflags & RT_SVG) && indexes[idx].svgmarkup)
+                        {
+                            auto midx = indexes[idx].index;
+                            for (auto szidx = 0; szidx < count; ++szidx, ++midx)
+                            {
+                                auto& entry = bitmaps[midx];
+                                RecordSVG(entry, -1, {}, {}, bgcolor, *(indexes[idx].svgmarkup), false);
+                            }
+                        }
+                        else if ((resflags & RT_PNG) || (resflags & RT_JPG) || (resflags & RT_BMP) || (resflags & RT_PSD) ||
+                            (resflags & RT_GENERIC_IMG))
+                        {
+                            auto& entry = bitmaps[indexes[idx].index];
+                            auto source = entry.first.hasCommonPrefetch ? (stbi_uc*)prefetched.data() :
+                                (stbi_uc*)entry.first.data.data();
+                            auto data = source + entry.first.prefetched.first;
+                            auto sz = entry.first.prefetched.second - entry.first.prefetched.first;
+                            RecordImage(entry, -1, {}, {}, (stbi_uc*)data, sz, false);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (createTexAtlas)
+        {
+            auto texid = Config.platform->UploadTexturesToGPU(ImVec2{ (float)totalwidth, 
+                (float)maxheight }, pixelbuf);
+            std::free(pixelbuf);
+
+            for (auto idx = bmstart; idx < (int)bitmaps.size(); ++idx)
+                bitmaps[idx].second = texid;
+        }
+
+        return totalBytes;
+    }
+
+    void ImGuiRenderer::DrawDebugRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness)
+    {
+        if (GetContext().PopupTarget != -1)
+        {
+            startpos += GetContext().popupOrigin;
+            endpos += GetContext().popupOrigin;
+        }
+
+        Round(startpos); Round(endpos); thickness = roundf(thickness);
+        debugrects.push_back({ startpos, endpos, color, thickness });
+    }
+
+    void ImGuiRenderer::ConstructRoundedRect(ImVec2 startpos, ImVec2 endpos, float topleftr, float toprightr, float bottomrightr, float bottomleftr)
+    {
+        auto& dl = *((ImDrawList*)UserData);
+        auto minlength = std::min(endpos.x - startpos.x, endpos.y - startpos.y);
+        topleftr = std::min(topleftr, minlength);
+        toprightr = std::min(toprightr, minlength);
+        bottomrightr = std::min(bottomrightr, minlength);
+        bottomleftr = std::min(bottomleftr, minlength);
+
+        dl.PathClear();
+        dl.PathLineTo(ImVec2{ startpos.x, endpos.y - bottomleftr });
+        dl.PathLineTo(ImVec2{ startpos.x, startpos.y + topleftr });
+        if (topleftr > 0.f) dl.PathArcToFast(ImVec2{ startpos.x + topleftr, startpos.y + topleftr }, topleftr, 6, 9);
+        dl.PathLineTo(ImVec2{ endpos.x - toprightr, startpos.y });
+        if (toprightr > 0.f) dl.PathArcToFast(ImVec2{ endpos.x - toprightr, startpos.y + toprightr }, toprightr, 9, 12);
+        dl.PathLineTo(ImVec2{ endpos.x, endpos.y - bottomrightr });
+        if (bottomrightr > 0.f) dl.PathArcToFast(ImVec2{ endpos.x - bottomrightr, endpos.y - bottomrightr }, bottomrightr, 0, 3);
+        dl.PathLineTo(ImVec2{ startpos.x - bottomleftr, endpos.y });
+        if (bottomleftr > 0.f) dl.PathArcToFast(ImVec2{ startpos.x + bottomleftr, endpos.y - bottomleftr }, bottomleftr, 3, 6);
+    }
+
+    int64_t ImGuiRenderer::RecordImage(std::pair<ImageLookupKey, ImTextureID>& entry, int32_t id, ImVec2 pos, ImVec2 size, stbi_uc* data, int bufsz, bool draw)
+    {
+        int width = 0, height = 0;
+        auto pixels = stbi_load_from_memory(data, bufsz, &width, &height, NULL, 4);
+        int64_t bytes = 0;
+
+        if (pixels != nullptr && width > 0 && height > 0)
+        {
+            entry.first.data.assign((char*)data, bufsz);
+
+            auto texid = Config.platform->UploadTexturesToGPU(ImVec2{ (float)width, (float)height }, pixels);
+            entry.second = texid;
+
+            if (draw)
+            {
+                auto& dl = *((ImDrawList*)UserData);
+                dl.AddImage(texid, pos, pos + size, entry.first.uvrect.Min, entry.first.uvrect.Max);
+            }
+
+            bytes = width * height * 4;
+        }
+        else
+            fprintf(stderr, "Image provided is not valid...\n");
+
+        stbi_image_free(pixels);
+        return bytes;
+    }
+
+    int64_t ImGuiRenderer::RecordGif(std::pair<GifLookupKey, ImTextureID>& entry, int32_t id, ImVec2 pos, ImVec2 size, stbi_uc* data, int bufsz, bool draw)
+    {
+        using namespace std::chrono;
+
+        int width, height, frames, channels;
+        int* delays = nullptr;
+        auto pixels = stbi_load_gif_from_memory(data, bufsz, &delays, &width, &height, &frames, &channels, 4);
+        int64_t bytes = 0;
+
+        if (pixels != nullptr && width > 0 && height > 0 && frames > 0)
+        {
+            entry.first.id = id;
+            entry.first.data.assign((char*)data, bufsz);
+            entry.first.totalframe = frames;
+            entry.first.delays = delays;
+            entry.first.lastTime = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+            entry.first.size = ImVec2{ (float)width, (float)height };
+            entry.first.uvmaps.reserve(frames);
+
+            auto relw = 1.f / (float)frames;
+            auto currx = 0.f;
+
+            for (auto fidx = 0; fidx < frames; ++fidx)
+            {
+                auto min = currx, max = currx + relw;
+                entry.first.uvmaps.emplace_back(ImVec2{ min, 0.f }, ImVec2{ max, 1.f });
+                currx += relw;
+            }
+
+            auto sz = entry.first.size;
+            sz.x *= (float)frames;
+            entry.second = Config.platform->UploadTexturesToGPU(sz, pixels);
+
+            if (draw)
+            {
+                auto& dl = *((ImDrawList*)UserData);
+                auto uvrect = entry.first.uvmaps[entry.first.currframe];
+                dl.AddImage(entry.second, pos, pos + size, uvrect.Min, uvrect.Max);
+            }
+
+            bytes = frames * width * height * 4;
+        }
+
+        stbi_image_free(pixels);
+        return bytes;
+    }
+
+    int64_t ImGuiRenderer::RecordSVG(std::pair<ImageLookupKey, ImTextureID>& entry, int32_t id, ImVec2 pos, ImVec2 size, uint32_t color, lunasvg::Document& document, bool draw)
+    {
+        entry.first.id = id;
+        entry.first.size = size;
+        int64_t bytes = 0;
+
+        auto bitmap = document.renderToBitmap((int)size.x, (int)size.y, color);
+        bitmap.convertToRGBA();
+
+        auto pixels = bitmap.data();
+        auto texid = Config.platform->UploadTexturesToGPU(size, pixels);
+        entry.second = texid;
+
+        if (draw)
+        {
+            auto& dl = *((ImDrawList*)UserData);
+            dl.AddImage(texid, pos, pos + size, entry.first.uvrect.Min, entry.first.uvrect.Max);
+        }
+
+        bytes = (int64_t)size.x * (int64_t)size.y * 4;
+        return bytes;
+    }
+
+    float IRenderer::EllipsisWidth(void* fontptr, float sz)
+    {
+        return GetTextSize("...", fontptr, sz).x;
+    }
+
+#pragma endregion
+
+#pragma region SVG Renderer
+
+    // Helper to format uint32_t color to SVG "rgb(r,g,b)" or "rgba(r,g,b,a_float)" string into a buffer
+    // Returns the number of characters written (excluding null terminator).
+    inline int formatColorToSvg(char* buffer, size_t bufferSize, uint32_t colorInt)
+    {
+        auto [r, g, b, a] = DecomposeColor(colorInt); // Assumes DecomposeColor is available
+        if (a == 255)
+        {
+            return snprintf(buffer, bufferSize, "rgb(%d,%d,%d)", r, g, b);
+        }
+        else
+        {
+            return snprintf(buffer, bufferSize, "rgba(%d,%d,%d,%.3f)", r, g, b, static_cast<float>(a) / 255.0f);
+        }
+    }
+
+    // Helper to format uint32_t color's alpha to SVG opacity string into a buffer
+    // Returns the number of characters written.
+    inline int formatOpacityToSvg(char* buffer, size_t bufferSize, uint32_t colorInt) 
+    {
+        auto [r, g, b, a] = DecomposeColor(colorInt);
+        return snprintf(buffer, bufferSize, "%.3f", static_cast<float>(a) / 255.0f);
+    }
+
+    struct SVGRenderer final : public IRenderer
+    {
+        ImVec2(*textMeasureFunc)(std::string_view text, void* fontPtr, float sz, float wrapWidth);
+
+        int defsIdCounter;
+        std::string currentClipPathId; // Kept as std::string for convenience of ID management
+        bool clippingActive;
+        ImVec2 svgDimensions;
+
+        std::string currentFontFamily; // Kept as std::string
+        float currentFontSizePixels;
+
+        static constexpr size_t svgMainBufferSize = 1024 * 64; // 64KB for main content
+        static constexpr size_t svgDefsBufferSize = 1024 * 8;  // 8KB for <defs> content
+        static constexpr size_t scratchBufferSize = 1024 * 2;  // 2KB for temporary formatting
+
+        char mainSvgBuffer[svgMainBufferSize];
+        size_t mainSvgBufferOffset;
+
+        char defsBuffer[svgDefsBufferSize];
+        size_t defsBufferOffset;
+
+        char scratchBuffer[scratchBufferSize]; // For formatting individual elements
+
+        // Helper to append data to a buffer, handling potential overflow.
+        void appendToBuffer(char* destBuffer, size_t& destOffset, size_t destCapacity, const char* srcData, int srcLen) 
+        {
+            if (srcLen <= 0) return;
+            if (destOffset + srcLen < destCapacity) {
+                memcpy(destBuffer + destOffset, srcData, srcLen);
+                destOffset += srcLen;
+                destBuffer[destOffset] = '\0'; // Keep null-terminated for safety if used as C-string
+            }
+            else {
+                // Handle overflow: for now, just don't append to prevent overrun.
+                // Optionally, log an error or append an overflow marker if space allows.
+            }
+        }
+
+        void appendStringViewToBuffer(char* destBuffer, size_t& destOffset, size_t destCapacity, std::string_view sv) 
+        {
+            appendToBuffer(destBuffer, destOffset, destCapacity, sv.data(), static_cast<int>(sv.length()));
+        }
+
+        SVGRenderer(ImVec2(*measureFunc)(std::string_view text, void* fontPtr, float sz, float wrapWidth), ImVec2 dimensionsVal = { 800, 600 })
+            : textMeasureFunc(measureFunc),
+            defsIdCounter(0),
+            clippingActive(false),
+            svgDimensions(dimensionsVal),
+            currentFontFamily("sans-serif"),
+            currentFontSizePixels(16.f),
+            mainSvgBufferOffset(0),
+            defsBufferOffset(0)
+        {
+            mainSvgBuffer[0] = '\0';
+            defsBuffer[0] = '\0';
+            Reset();
+        }
+
+        RendererType Type() const { return RendererType::SVG; }
+
+        void Reset() override
+        {
+            mainSvgBufferOffset = 0;
+            mainSvgBuffer[0] = '\0';
+            defsBufferOffset = 0;
+            defsBuffer[0] = '\0';
+
+            defsIdCounter = 0;
+            currentClipPathId.clear();
+            clippingActive = false;
+
+            this->size = svgDimensions;
+        }
+
+        std::string GetSVG()
+        {
+            std::string finalSvgStr;
+            // Estimate size
+            size_t headerLen = 200; // Approx
+            size_t footerLen = 20;  // Approx
+            finalSvgStr.reserve(headerLen + defsBufferOffset + mainSvgBufferOffset + footerLen);
+
+            float svgW = (svgDimensions.x > 0.001f) ? svgDimensions.x : 1.0f;
+            float svgH = (svgDimensions.y > 0.001f) ? svgDimensions.y : 1.0f;
+
+            int writtenHeader = snprintf(scratchBuffer, scratchBufferSize,
+                "<svg width=\"%.2f\" height=\"%.2f\" viewBox=\"0 0 %.2f %.2f\" "
+                "xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\">\n"
+                "  <defs>\n",
+                svgW, svgH, svgW, svgH);
+            if (writtenHeader > 0) finalSvgStr.append(scratchBuffer, writtenHeader);
+
+            if (defsBufferOffset > 0) 
+            {
+                finalSvgStr.append(defsBuffer, defsBufferOffset);
+            }
+            finalSvgStr.append("  </defs>\n"); // Close defs
+
+            if (mainSvgBufferOffset > 0) 
+            {
+                finalSvgStr.append(mainSvgBuffer, mainSvgBufferOffset);
+            }
+
+            finalSvgStr.append("</svg>\n");
+            return finalSvgStr;
+        }
+
+        void SetClipRect(ImVec2 startPos, ImVec2 endPos, bool intersect) override
+        {
+            if (clippingActive) 
+            { // Close previous clipping group in main content
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, "  </g>\n", strlen("  </g>\n"));
+            }
+
+            defsIdCounter++;
+            char clipIdCstr[64];
+            snprintf(clipIdCstr, sizeof(clipIdCstr), "clipPathDef%d", defsIdCounter);
+            currentClipPathId = clipIdCstr;
+
+            int defsWritten = snprintf(scratchBuffer, scratchBufferSize,
+                "    <clipPath id=\"%s\">\n"
+                "      <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" />\n"
+                "    </clipPath>\n",
+                currentClipPathId.c_str(),
+                startPos.x, startPos.y,
+                std::max(0.0f, endPos.x - startPos.x),
+                std::max(0.0f, endPos.y - startPos.y));
+            if (defsWritten > 0) 
+            {
+                appendToBuffer(defsBuffer, defsBufferOffset, svgDefsBufferSize, scratchBuffer, defsWritten);
+            }
+
+            int gWritten = snprintf(scratchBuffer, scratchBufferSize, "  <g clip-path=\"url(#%s)\">\n", currentClipPathId.c_str());
+            if (gWritten > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, gWritten);
+            }
+            clippingActive = true;
+        }
+
+        void ResetClipRect() override
+        {
+            if (clippingActive) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, "  </g>\n", strlen("  </g>\n"));
+                clippingActive = false;
+                currentClipPathId.clear();
+            }
+        }
+
+        void DrawLine(ImVec2 startPos, ImVec2 endPos, uint32_t color, float thickness = 1.f) override
+        {
+            if (thickness <= 0.f) return;
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+
+            int written = snprintf(scratchBuffer, scratchBufferSize,
+                "  <line x1=\"%.2f\" y1=\"%.2f\" x2=\"%.2f\" y2=\"%.2f\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                startPos.x, startPos.y, endPos.x, endPos.y, colorBuf, thickness);
+            if (written > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+            }
+        }
+
+        void DrawPolyline(ImVec2* points, int numPoints, uint32_t color, float thickness) override
+        {
+            if (numPoints < 2 || thickness <= 0.f) return;
+
+            char pointsListStr[scratchBufferSize / 2];
+            int pointsListOffset = 0;
+            char pointItemBuf[40];
+
+            for (int i = 0; i < numPoints; ++i) 
+            {
+                int currentPtLen = snprintf(pointItemBuf, sizeof(pointItemBuf), "%.2f,%.2f%s",
+                    points[i].x, points[i].y, (i == numPoints - 1 ? "" : " "));
+                if (pointsListOffset + currentPtLen < (int)sizeof(pointsListStr) - 1) { // -1 for null terminator
+                    memcpy(pointsListStr + pointsListOffset, pointItemBuf, currentPtLen);
+                    pointsListOffset += currentPtLen;
+                }
+                else { break; }
+            }
+            pointsListStr[pointsListOffset] = '\0';
+
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+
+            int written = snprintf(scratchBuffer, scratchBufferSize,
+                "  <polyline points=\"%s\" stroke=\"%s\" stroke-width=\"%.2f\" fill=\"none\" />\n",
+                pointsListStr, colorBuf, thickness);
+            if (written > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+            }
+        }
+
+        void DrawTriangle(ImVec2 pos1, ImVec2 pos2, ImVec2 pos3, uint32_t color, bool filled, float thickness = 1.f) override
+        {
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+
+            int written = 0;
+            if (filled) 
+            {
+                if (thickness > 0.0f) {
+                    written = snprintf(scratchBuffer, scratchBufferSize,
+                        "  <polygon points=\"%.2f,%.2f %.2f,%.2f %.2f,%.2f\" fill=\"%s\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                        pos1.x, pos1.y, pos2.x, pos2.y, pos3.x, pos3.y, colorBuf, colorBuf, thickness);
+                }
+                else {
+                    written = snprintf(scratchBuffer, scratchBufferSize,
+                        "  <polygon points=\"%.2f,%.2f %.2f,%.2f %.2f,%.2f\" fill=\"%s\" />\n",
+                        pos1.x, pos1.y, pos2.x, pos2.y, pos3.x, pos3.y, colorBuf);
+                }
+            }
+            else 
+            {
+                if (thickness <= 0.f) return;
+                written = snprintf(scratchBuffer, scratchBufferSize,
+                    "  <polygon points=\"%.2f,%.2f %.2f,%.2f %.2f,%.2f\" fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                    pos1.x, pos1.y, pos2.x, pos2.y, pos3.x, pos3.y, colorBuf, thickness);
+            }
+
+            if (written > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+            }
+        }
+
+        void DrawRect(ImVec2 startPos, ImVec2 endPos, uint32_t color, bool filled, float thickness = 1.f) override
+        {
+            float w = endPos.x - startPos.x;
+            float h = endPos.y - startPos.y;
+            if (w <= 0.001f && h <= 0.001f) 
+            {
+                if (!filled && thickness > 0.f && (std::abs(w) < 0.001f || std::abs(h) < 0.001f)) { /* line */ }
+                else return;
+            }
+            
+            w = std::max(0.0f, w);
+            h = std::max(0.0f, h);
+
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+            int written = 0;
+
+            if (filled) 
+            {
+                if (thickness > 0.0f) 
+                {
+                    written = snprintf(scratchBuffer, scratchBufferSize,
+                        "  <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"%s\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                        startPos.x, startPos.y, w, h, colorBuf, colorBuf, thickness);
+                }
+                else 
+                {
+                    written = snprintf(scratchBuffer, scratchBufferSize,
+                        "  <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"%s\" />\n",
+                        startPos.x, startPos.y, w, h, colorBuf);
+                }
+            }
+            else 
+            {
+                if (thickness <= 0.f) return;
+                written = snprintf(scratchBuffer, scratchBufferSize,
+                    "  <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                    startPos.x, startPos.y, w, h, colorBuf, thickness);
+            }
+
+            if (written > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+            }
+        }
+
+        void DrawRoundedRect(ImVec2 startPos, ImVec2 endPos, uint32_t color, bool filled,
+            float topLeftR, float topRightR, float bottomRightR, float bottomLeftR,
+            float thickness) override
+        {
+            float w = endPos.x - startPos.x;
+            float h = endPos.y - startPos.y;
+            if (w <= 0.001f || h <= 0.001f) return;
+            w = std::max(0.0f, w);
+            h = std::max(0.0f, h);
+
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+            int written = 0;
+
+            bool uniformRadii = (std::abs(topLeftR - topRightR) < 0.01f &&
+                std::abs(topRightR - bottomRightR) < 0.01f &&
+                std::abs(bottomRightR - bottomLeftR) < 0.01f);
+
+            if (uniformRadii && topLeftR >= 0.f) 
+            {
+                float radius = std::min({ topLeftR, w / 2.0f, h / 2.0f });
+                radius = std::max(0.0f, radius);
+                if (filled) {
+                    if (thickness > 0.0f) 
+                    {
+                        written = snprintf(scratchBuffer, scratchBufferSize,
+                            "  <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" rx=\"%.2f\" ry=\"%.2f\" fill=\"%s\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                            startPos.x, startPos.y, w, h, radius, radius, colorBuf, colorBuf, thickness);
+                    }
+                    else 
+                    {
+                        written = snprintf(scratchBuffer, scratchBufferSize,
+                            "  <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" rx=\"%.2f\" ry=\"%.2f\" fill=\"%s\" />\n",
+                            startPos.x, startPos.y, w, h, radius, radius, colorBuf);
+                    }
+                }
+                else 
+                {
+                    if (thickness <= 0.f) return;
+                    written = snprintf(scratchBuffer, scratchBufferSize,
+                        "  <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" rx=\"%.2f\" ry=\"%.2f\" fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                        startPos.x, startPos.y, w, h, radius, radius, colorBuf, thickness);
+                }
+            }
+            else 
+            {
+                float tlr = std::min({ std::max(0.0f, topLeftR), w / 2.0f, h / 2.0f });
+                float trr = std::min({ std::max(0.0f, topRightR), w / 2.0f, h / 2.0f });
+                float brr = std::min({ std::max(0.0f, bottomRightR), w / 2.0f, h / 2.0f });
+                float blr = std::min({ std::max(0.0f, bottomLeftR), w / 2.0f, h / 2.0f });
+
+                char pathDataBuf[1024];
+                int pathOffset = 0;
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "M %.2f,%.2f ", startPos.x + tlr, startPos.y);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "L %.2f,%.2f ", endPos.x - trr, startPos.y);
+                if (trr > 0.001f) pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "A %.2f,%.2f 0 0 1 %.2f,%.2f ", trr, trr, endPos.x, startPos.y + trr);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "L %.2f,%.2f ", endPos.x, endPos.y - brr);
+                if (brr > 0.001f) pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "A %.2f,%.2f 0 0 1 %.2f,%.2f ", brr, brr, endPos.x - brr, endPos.y);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "L %.2f,%.2f ", startPos.x + blr, endPos.y);
+                if (blr > 0.001f) pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "A %.2f,%.2f 0 0 1 %.2f,%.2f ", blr, blr, startPos.x, endPos.y - blr);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "L %.2f,%.2f ", startPos.x, startPos.y + tlr);
+                if (tlr > 0.001f) pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "A %.2f,%.2f 0 0 1 %.2f,%.2f ", tlr, tlr, startPos.x + tlr, startPos.y);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "Z");
+
+                if (pathOffset > 0 && pathOffset < (int)sizeof(pathDataBuf)) 
+                {
+                    if (filled) 
+                    {
+                        if (thickness > 0.0f) 
+                        {
+                            written = snprintf(scratchBuffer, scratchBufferSize, "  <path d=\"%s\" fill=\"%s\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                                pathDataBuf, colorBuf, colorBuf, thickness);
+                        }
+                        else 
+                        {
+                            written = snprintf(scratchBuffer, scratchBufferSize, "  <path d=\"%s\" fill=\"%s\" />\n",
+                                pathDataBuf, colorBuf);
+                        }
+                    }
+                    else 
+                    {
+                        if (thickness <= 0.f) return;
+                        written = snprintf(scratchBuffer, scratchBufferSize, "  <path d=\"%s\" fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                            pathDataBuf, colorBuf, thickness);
+                    }
+                }
+            }
+
+            if (written > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+            }
+        }
+
+        void DrawRectGradient(ImVec2 startPos, ImVec2 endPos, uint32_t colorFrom, uint32_t colorTo, Direction dir) override
+        {
+            float w = endPos.x - startPos.x;
+            float h = endPos.y - startPos.y;
+            if (w <= 0.001f || h <= 0.001f) return;
+            w = std::max(0.0f, w); h = std::max(0.0f, h);
+
+            defsIdCounter++;
+            char gradientIdCstr[64];
+            snprintf(gradientIdCstr, sizeof(gradientIdCstr), "gradRectDef%d", defsIdCounter);
+
+            char colorFromBuf[64], colorToBuf[64];
+            char opacityFromBuf[16], opacityToBuf[16];
+            formatColorToSvg(colorFromBuf, sizeof(colorFromBuf), colorFrom);
+            formatColorToSvg(colorToBuf, sizeof(colorToBuf), colorTo);
+            formatOpacityToSvg(opacityFromBuf, sizeof(opacityFromBuf), colorFrom);
+            formatOpacityToSvg(opacityToBuf, sizeof(opacityToBuf), colorTo);
+
+            int defsWritten = snprintf(scratchBuffer, scratchBufferSize,
+                "    <linearGradient id=\"%s\" %s>\n"
+                "      <stop offset=\"0%%\" style=\"stop-color:%s;stop-opacity:%s\" />\n"
+                "      <stop offset=\"100%%\" style=\"stop-color:%s;stop-opacity:%s\" />\n"
+                "    </linearGradient>\n",
+                gradientIdCstr,
+                (dir == DIR_Horizontal ? "x1=\"0%\" y1=\"0%\" x2=\"100%\" y2=\"0%\"" : "x1=\"0%\" y1=\"0%\" x2=\"0%\" y2=\"100%\""),
+                colorFromBuf, opacityFromBuf,
+                colorToBuf, opacityToBuf);
+            if (defsWritten > 0) 
+            {
+                appendToBuffer(defsBuffer, defsBufferOffset, svgDefsBufferSize, scratchBuffer, defsWritten);
+            }
+
+            int rectWritten = snprintf(scratchBuffer, scratchBufferSize,
+                "  <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" fill=\"url(#%s)\" />\n",
+                startPos.x, startPos.y, w, h, gradientIdCstr);
+            if (rectWritten > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, rectWritten);
+            }
+        }
+
+        void DrawRoundedRectGradient(ImVec2 startPos, ImVec2 endPos,
+            float topLeftR, float topRightR, float bottomRightR, float bottomLeftR,
+            uint32_t colorFrom, uint32_t colorTo, Direction dir) override
+        {
+            float w = endPos.x - startPos.x;
+            float h = endPos.y - startPos.y;
+            if (w <= 0.001f || h <= 0.001f) return;
+            w = std::max(0.0f, w); h = std::max(0.0f, h);
+
+            defsIdCounter++;
+            char gradientIdCstr[64];
+            snprintf(gradientIdCstr, sizeof(gradientIdCstr), "gradRoundRectDef%d", defsIdCounter);
+
+            char colorFromBuf[64], colorToBuf[64];
+            char opacityFromBuf[16], opacityToBuf[16];
+            formatColorToSvg(colorFromBuf, sizeof(colorFromBuf), colorFrom);
+            formatColorToSvg(colorToBuf, sizeof(colorToBuf), colorTo);
+            formatOpacityToSvg(opacityFromBuf, sizeof(opacityFromBuf), colorFrom);
+            formatOpacityToSvg(opacityToBuf, sizeof(opacityToBuf), colorTo);
+
+            int defsWritten = snprintf(scratchBuffer, scratchBufferSize,
+                "    <linearGradient id=\"%s\" %s>\n"
+                "      <stop offset=\"0%%\" style=\"stop-color:%s;stop-opacity:%s\" />\n"
+                "      <stop offset=\"100%%\" style=\"stop-color:%s;stop-opacity:%s\" />\n"
+                "    </linearGradient>\n",
+                gradientIdCstr,
+                (dir == DIR_Horizontal ? "x1=\"0%\" y1=\"0%\" x2=\"100%\" y2=\"0%\"" : "x1=\"0%\" y1=\"0%\" x2=\"0%\" y2=\"100%\""),
+                colorFromBuf, opacityFromBuf,
+                colorToBuf, opacityToBuf);
+
+            if (defsWritten > 0) 
+            {
+                appendToBuffer(defsBuffer, defsBufferOffset, svgDefsBufferSize, scratchBuffer, defsWritten);
+            }
+
+            int shapeWritten = 0;
+            bool uniformRadii = (std::abs(topLeftR - topRightR) < 0.01f &&
+                std::abs(topRightR - bottomRightR) < 0.01f &&
+                std::abs(bottomRightR - bottomLeftR) < 0.01f);
+
+            if (uniformRadii && topLeftR >= 0.f) 
+            {
+                float radius = std::min({ topLeftR, w / 2.0f, h / 2.0f });
+                radius = std::max(0.0f, radius);
+                shapeWritten = snprintf(scratchBuffer, scratchBufferSize,
+                    "  <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" rx=\"%.2f\" ry=\"%.2f\" fill=\"url(#%s)\" />\n",
+                    startPos.x, startPos.y, w, h, radius, radius, gradientIdCstr);
+            }
+            else 
+            {
+                float tlr = std::min({ std::max(0.0f, topLeftR), w / 2.0f, h / 2.0f });
+                float trr = std::min({ std::max(0.0f, topRightR), w / 2.0f, h / 2.0f });
+                float brr = std::min({ std::max(0.0f, bottomRightR), w / 2.0f, h / 2.0f });
+                float blr = std::min({ std::max(0.0f, bottomLeftR), w / 2.0f, h / 2.0f });
+
+                char pathDataBuf[1024];
+                int pathOffset = 0;
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "M %.2f,%.2f ", startPos.x + tlr, startPos.y);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "L %.2f,%.2f ", endPos.x - trr, startPos.y);
+                if (trr > 0.001f) pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "A %.2f,%.2f 0 0 1 %.2f,%.2f ", trr, trr, endPos.x, startPos.y + trr);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "L %.2f,%.2f ", endPos.x, endPos.y - brr);
+                if (brr > 0.001f) pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "A %.2f,%.2f 0 0 1 %.2f,%.2f ", brr, brr, endPos.x - brr, endPos.y);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "L %.2f,%.2f ", startPos.x + blr, endPos.y);
+                if (blr > 0.001f) pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "A %.2f,%.2f 0 0 1 %.2f,%.2f ", blr, blr, startPos.x, endPos.y - blr);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "L %.2f,%.2f ", startPos.x, startPos.y + tlr);
+                if (tlr > 0.001f) pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "A %.2f,%.2f 0 0 1 %.2f,%.2f ", tlr, tlr, startPos.x + tlr, startPos.y);
+                pathOffset += snprintf(pathDataBuf + pathOffset, sizeof(pathDataBuf) - pathOffset, "Z");
+
+                if (pathOffset > 0 && pathOffset < (int)sizeof(pathDataBuf)) 
+                {
+                    shapeWritten = snprintf(scratchBuffer, scratchBufferSize, "  <path d=\"%s\" fill=\"url(#%s)\" />\n",
+                        pathDataBuf, gradientIdCstr);
+                }
+            }
+
+            if (shapeWritten > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, shapeWritten);
+            }
+        }
+
+        void DrawPolygon(ImVec2* points, int numPoints, uint32_t color, bool filled, float thickness = 1.f) override
+        {
+            if (numPoints < 3) return;
+
+            char pointsListStr[scratchBufferSize / 2];
+            int pointsListOffset = 0;
+            char pointItemBuf[40];
+            for (int i = 0; i < numPoints; ++i) 
+            {
+                int currentPtLen = snprintf(pointItemBuf, sizeof(pointItemBuf), "%.2f,%.2f%s",
+                    points[i].x, points[i].y, (i == numPoints - 1 ? "" : " "));
+                if (pointsListOffset + currentPtLen < (int)sizeof(pointsListStr) - 1) 
+                {
+                    memcpy(pointsListStr + pointsListOffset, pointItemBuf, currentPtLen);
+                    pointsListOffset += currentPtLen;
+                }
+                else { break; }
+            }
+            pointsListStr[pointsListOffset] = '\0';
+
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+            int written = 0;
+
+            if (filled) {
+                if (thickness > 0.0f) 
+                {
+                    written = snprintf(scratchBuffer, scratchBufferSize, "  <polygon points=\"%s\" fill=\"%s\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                        pointsListStr, colorBuf, colorBuf, thickness);
+                }
+                else 
+                {
+                    written = snprintf(scratchBuffer, scratchBufferSize, "  <polygon points=\"%s\" fill=\"%s\" />\n",
+                        pointsListStr, colorBuf);
+                }
+            }
+            else 
+            {
+                if (thickness <= 0.f) return;
+                written = snprintf(scratchBuffer, scratchBufferSize, "  <polygon points=\"%s\" fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                    pointsListStr, colorBuf, thickness);
+            }
+
+            if (written > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+            }
+        }
+
+        void DrawPolyGradient(ImVec2* points, uint32_t* colors, int numPoints) override
+        {
+            if (numPoints > 0 && colors) 
+            { // Simplified: use first color for solid fill
+                DrawPolygon(points, numPoints, colors[0], true, 0.f);
+            }
+        }
+
+        void DrawCircle(ImVec2 center, float radius, uint32_t color, bool filled, float thickness = 1.f) override
+        {
+            if (radius <= 0.001f) return;
+            radius = std::max(0.0f, radius);
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+            int written = 0;
+
+            if (filled) 
+            {
+                if (thickness > 0.0f) 
+                {
+                    written = snprintf(scratchBuffer, scratchBufferSize, "  <circle cx=\"%.2f\" cy=\"%.2f\" r=\"%.2f\" fill=\"%s\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                        center.x, center.y, radius, colorBuf, colorBuf, thickness);
+                }
+                else 
+                {
+                    written = snprintf(scratchBuffer, scratchBufferSize, "  <circle cx=\"%.2f\" cy=\"%.2f\" r=\"%.2f\" fill=\"%s\" />\n",
+                        center.x, center.y, radius, colorBuf);
+                }
+            }
+            else 
+            {
+                if (thickness <= 0.f) return;
+                written = snprintf(scratchBuffer, scratchBufferSize, "  <circle cx=\"%.2f\" cy=\"%.2f\" r=\"%.2f\" fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                    center.x, center.y, radius, colorBuf, thickness);
+            }
+
+            if (written > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+            }
+        }
+
+        void DrawSector(ImVec2 center, float radius, int startAngleDeg, int endAngleDeg, uint32_t color, bool filled, bool inverted, float thickness = 1.f) override
+        {
+            if (radius <= 0.001f) return;
+            radius = std::max(0.0f, radius);
+            float startRad = static_cast<float>(startAngleDeg) * M_PI / 180.0f;
+            float endRad = static_cast<float>(endAngleDeg) * M_PI / 180.0f;
+
+            ImVec2 pStart = { center.x + radius * cosf(startRad), center.y + radius * sinf(startRad) };
+            ImVec2 pEnd = { center.x + radius * cosf(endRad), center.y + radius * sinf(endRad) };
+
+            float angleDiff = static_cast<float>(endAngleDeg - startAngleDeg);
+            while (angleDiff <= -360.0f) angleDiff += 360.0f;
+            while (angleDiff > 360.0f) angleDiff -= 360.0f;
+
+            int largeArcFlag = (std::abs(angleDiff) > 180.0f) ? 1 : 0;
+            int sweepFlag = (angleDiff >= 0.0f) ? 1 : 0;
+
+            if (std::abs(angleDiff) >= 359.99f) 
+            {
+                DrawCircle(center, radius, color, filled, thickness);
+                return;
+            }
+
+            if (inverted) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, "\n", strlen("\n"));
+            }
+
+            char pathDataBuf[512];
+            snprintf(pathDataBuf, sizeof(pathDataBuf), "M %.2f,%.2f L %.2f,%.2f A %.2f,%.2f 0 %d,%d %.2f,%.2f Z",
+                center.x, center.y, pStart.x, pStart.y, radius, radius, largeArcFlag, sweepFlag, pEnd.x, pEnd.y);
+
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+            int written = 0;
+
+            if (filled) 
+            {
+                if (thickness > 0.0f) 
+                {
+                    written = snprintf(scratchBuffer, scratchBufferSize, "  <path d=\"%s\" fill=\"%s\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                        pathDataBuf, colorBuf, colorBuf, thickness);
+                }
+                else 
+                {
+                    written = snprintf(scratchBuffer, scratchBufferSize, "  <path d=\"%s\" fill=\"%s\" />\n",
+                        pathDataBuf, colorBuf);
+                }
+            }
+            else 
+            {
+                if (thickness <= 0.f) return;
+                written = snprintf(scratchBuffer, scratchBufferSize, "  <path d=\"%s\" fill=\"none\" stroke=\"%s\" stroke-width=\"%.2f\" />\n",
+                    pathDataBuf, colorBuf, thickness);
+            }
+
+            if (written > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+            }
+        }
+
+        void DrawRadialGradient(ImVec2 center, float radius, uint32_t colorIn, uint32_t colorOut, int startAngleDeg, int endAngleDeg) override
+        {
+            if (radius <= 0.001f) return;
+            radius = std::max(0.0f, radius);
+            defsIdCounter++;
+            char gradientIdCstr[64];
+            snprintf(gradientIdCstr, sizeof(gradientIdCstr), "gradRadialDef%d", defsIdCounter);
+
+            char colorInBuf[64], colorOutBuf[64];
+            char opacityInBuf[16], opacityOutBuf[16];
+            formatColorToSvg(colorInBuf, sizeof(colorInBuf), colorIn);
+            formatColorToSvg(colorOutBuf, sizeof(colorOutBuf), colorOut);
+            formatOpacityToSvg(opacityInBuf, sizeof(opacityInBuf), colorIn);
+            formatOpacityToSvg(opacityOutBuf, sizeof(opacityOutBuf), colorOut);
+
+            int defsWritten = snprintf(scratchBuffer, scratchBufferSize,
+                "    <radialGradient id=\"%s\" cx=\"50%%\" cy=\"50%%\" r=\"50%%\" fx=\"50%%\" fy=\"50%%\">\n"
+                "      <stop offset=\"0%%\" style=\"stop-color:%s;stop-opacity:%s\" />\n"
+                "      <stop offset=\"100%%\" style=\"stop-color:%s;stop-opacity:%s\" />\n"
+                "    </radialGradient>\n",
+                gradientIdCstr, colorInBuf, opacityInBuf, colorOutBuf, opacityOutBuf);
+
+            if (defsWritten > 0) 
+            {
+                appendToBuffer(defsBuffer, defsBufferOffset, svgDefsBufferSize, scratchBuffer, defsWritten);
+            }
+
+            int shapeWritten = 0;
+            float angleDiffAbs = std::abs(static_cast<float>(endAngleDeg - startAngleDeg));
+            while (angleDiffAbs >= 360.0f) angleDiffAbs -= 360.0f;
+
+            if (angleDiffAbs < 359.99f && !(startAngleDeg == 0 && endAngleDeg == 0)) 
+            {
+                float startRad = static_cast<float>(startAngleDeg) * M_PI / 180.0f;
+                float endRad = static_cast<float>(endAngleDeg) * M_PI / 180.0f;
+                ImVec2 pStart = { center.x + radius * cosf(startRad), center.y + radius * sinf(startRad) };
+                ImVec2 pEnd = { center.x + radius * cosf(endRad), center.y + radius * sinf(endRad) };
+
+                float angleDiffSweep = static_cast<float>(endAngleDeg - startAngleDeg);
+                while (angleDiffSweep <= -360.0f) angleDiffSweep += 360.0f;
+                while (angleDiffSweep > 360.0f) angleDiffSweep -= 360.0f;
+                int largeArcFlag = (std::abs(angleDiffSweep) > 180.0f) ? 1 : 0;
+                int sweepFlag = (angleDiffSweep >= 0.0f) ? 1 : 0;
+
+                char pathDataBuf[512];
+                snprintf(pathDataBuf, sizeof(pathDataBuf), "M %.2f,%.2f L %.2f,%.2f A %.2f,%.2f 0 %d,%d %.2f,%.2f Z",
+                    center.x, center.y, pStart.x, pStart.y, radius, radius, largeArcFlag, sweepFlag, pEnd.x, pEnd.y);
+                shapeWritten = snprintf(scratchBuffer, scratchBufferSize, "  <path d=\"%s\" fill=\"url(#%s)\" />\n",
+                    pathDataBuf, gradientIdCstr);
+            }
+            else 
+            {
+                shapeWritten = snprintf(scratchBuffer, scratchBufferSize, "  <circle cx=\"%.2f\" cy=\"%.2f\" r=\"%.2f\" fill=\"url(#%s)\" />\n",
+                    center.x, center.y, radius, gradientIdCstr);
+            }
+
+            if (shapeWritten > 0) 
+            {
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, shapeWritten);
+            }
+        }
+
+        bool SetCurrentFont(std::string_view family, float sz, FontType type) override { return false; }
+        bool SetCurrentFont(void* fontPtr, float sz) override { return false; }
+        void ResetFont() override {}
+
+        ImVec2 GetTextSize(std::string_view text, void* fontPtr, float sz, float wrapWidth = -1.f) override
+        {
+            if (textMeasureFunc) 
+            {
+                return textMeasureFunc(text, fontPtr, sz, wrapWidth);
+            }
+
+            return ImVec2{ static_cast<float>(text.length()) * sz * 0.6f, sz }; // Basic fallback
+        }
+
+        void DrawText(std::string_view text, ImVec2 pos, uint32_t color, float wrapWidth = -1.f) override
+        {
+            float adjustedY = pos.y + currentFontSizePixels * 0.8f;
+
+            char colorBuf[64];
+            formatColorToSvg(colorBuf, sizeof(colorBuf), color);
+
+            int writtenOffset = snprintf(scratchBuffer, scratchBufferSize,
+                "  <text x=\"%.2f\" y=\"%.2f\" font-family=\"%s\" font-size=\"%.0fpx\" fill=\"%s\">",
+                pos.x, adjustedY, currentFontFamily.c_str(), currentFontSizePixels, colorBuf);
+            if (writtenOffset <= 0) return;
+            appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, writtenOffset);
+
+            char escCharBuf[10];
+            for (char c : text) 
+            {
+                const char* escSeq = nullptr;
+                int seqLen = 1;
+                switch (c) 
+                {
+                case '&':  escSeq = "&amp;"; seqLen = 5; break;
+                case '<':  escSeq = "&lt;"; seqLen = 4; break;
+                case '>':  escSeq = "&gt;"; seqLen = 4; break;
+                case '"':  escSeq = "&quot;"; seqLen = 6; break;
+                case '\'': escSeq = "&apos;"; seqLen = 6; break;
+                default:   escCharBuf[0] = c; escCharBuf[1] = '\0'; escSeq = escCharBuf; break;
+                }
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, escSeq, seqLen);
+            }
+
+            appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, "</text>\n", strlen("</text>\n"));
+        }
+
+        void DrawTooltip(ImVec2 pos, std::string_view text) override
+        {
+            if (text.empty()) return;
+
+            const uint32_t bgColorVal = 0xE0FFFFE0;
+            const uint32_t textColorVal = 0xFF000000;
+            const uint32_t borderColorVal = 0xFFCCCCCC;
+            const float padding = 5.0f;
+            const float defaultTooltipFontSize = 12.0f;
+            const char* defaultTooltipFontFamily = "sans-serif";
+
+            ImVec2 textDim = { 0.0f, 0.0f };
+            if (textMeasureFunc) 
+            {
+                textDim = textMeasureFunc(text, nullptr, defaultTooltipFontSize, -1.f);
+            }
+            else 
+            {
+                textDim = ImVec2{ static_cast<float>(text.length()) * defaultTooltipFontSize * 0.6f, defaultTooltipFontSize };
+            }
+
+            float rectX = pos.x;
+            float rectY = pos.y;
+            float rectW = textDim.x + 2 * padding;
+            float rectH = textDim.y + 2 * padding;
+
+            float textXPos = pos.x + padding;
+            float textYPos = pos.y + padding + textDim.y * 0.8f;
+
+            char bgColorBuf[64], textColorBuf[64], borderColorBuf[64];
+            formatColorToSvg(bgColorBuf, sizeof(bgColorBuf), bgColorVal);
+            formatColorToSvg(textColorBuf, sizeof(textColorBuf), textColorVal);
+            formatColorToSvg(borderColorBuf, sizeof(borderColorBuf), borderColorVal);
+
+            int initialOffset = 0;
+            initialOffset += snprintf(scratchBuffer + initialOffset, scratchBufferSize - initialOffset, "  <g>\n");
+            initialOffset += snprintf(scratchBuffer + initialOffset, scratchBufferSize - initialOffset,
+                "    <rect x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" rx=\"3\" ry=\"3\" fill=\"%s\" stroke=\"%s\" stroke-width=\"1\" />\n",
+                rectX, rectY, rectW, rectH, bgColorBuf, borderColorBuf);
+            appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, initialOffset);
+
+            int textPartOffset = snprintf(scratchBuffer, scratchBufferSize,
+                "    <text x=\"%.2f\" y=\"%.2f\" font-family=\"%s\" font-size=\"%.0fpx\" fill=\"%s\">",
+                textXPos, textYPos, defaultTooltipFontFamily, defaultTooltipFontSize, textColorBuf);
+            if (textPartOffset > 0) appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, textPartOffset);
+
+            char escCharBuf[10];
+            for (char c : text) 
+            {
+                const char* escSeq = nullptr; int seqLen = 1;
+                switch (c) 
+                {
+                case '&':  escSeq = "&amp;"; seqLen = 5; break; case '<':  escSeq = "&lt;"; seqLen = 4; break;
+                case '>':  escSeq = "&gt;"; seqLen = 4; break; case '"':  escSeq = "&quot;"; seqLen = 6; break;
+                case '\'': escSeq = "&apos;"; seqLen = 6; break; default:   escCharBuf[0] = c; escCharBuf[1] = '\0'; escSeq = escCharBuf; break;
+                }
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, escSeq, seqLen);
+            }
+
+            appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, "</text>\n  </g>\n", strlen("</text>\n  </g>\n"));
+        }
+
+
+        float EllipsisWidth(void* fontPtr, float sz) override {
+            if (textMeasureFunc) 
+            {
+                return textMeasureFunc("...", fontPtr, sz, -1.f).x;
+            }
+
+            return 3 * sz * 0.6f; // Basic fallback
+        }
+
+        bool StartOverlay(int32_t id, ImVec2 pos, ImVec2 size, uint32_t color) override { return true; }
+        void EndOverlay() override {}
+
+        bool DrawResource(int32_t resflags, ImVec2 pos, ImVec2 size, uint32_t color, std::string_view content, int32_t id) override
+        {
+            auto fromFile = (resflags & RT_PATH) != 0;
+
+            if (resflags & RT_SVG)
+            {
+                if (fromFile)
+                {
+                    int written = snprintf(scratchBuffer, scratchBufferSize,
+                        "  <image x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" xlink:href=\"%.*s\" />\n",
+                        pos.x, pos.y, size.x, size.y, (int)content.length(), content.data());
+                    if (written > 0) appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+                    return false;
+                }
+                if (content.empty()) return false;
+
+                int writtenOpen = snprintf(scratchBuffer, scratchBufferSize,
+                    "  <svg x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\">\n",
+                    pos.x, pos.y, size.x, size.y);
+                if (writtenOpen > 0) appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, writtenOpen);
+
+                appendStringViewToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, content);
+                appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, "\n  </svg>\n", strlen("\n  </svg>\n"));
+            }
+            else if ((resflags & RT_PNG) || (resflags & RT_JPG) || (resflags & RT_BMP) || (resflags & RT_PSD) ||
+                (resflags & RT_GENERIC_IMG))
+            {
+                if (size.x <= 0.001f || size.y <= 0.001f || content.empty()) return false;
+                size.x = std::max(0.0f, size.x); size.y = std::max(0.0f, size.y);
+
+                int written = snprintf(scratchBuffer, scratchBufferSize,
+                    "  <image x=\"%.2f\" y=\"%.2f\" width=\"%.2f\" height=\"%.2f\" xlink:href=\"%.*s\" />\n",
+                    pos.x, pos.y, size.x, size.y,
+                    (int)content.length(), content.data());
+                if (written > 0)
+                {
+                    appendToBuffer(mainSvgBuffer, mainSvgBufferOffset, svgMainBufferSize, scratchBuffer, written);
+                }
+            }
+
+            return true;
+        }
+    };
+
+#pragma endregion
+
+#pragma region Blend2D renderer
+
+#ifndef GLIMMER_DISABLE_BLEND2D_RENDERER
+
+    struct Blend2DRenderer final : public IRenderer
+    {
+        BLContext ctx;
+        BLImage renderTarget;
+        BLFont* font = nullptr;
+
+        // Resource cache structures adapted for Blend2D (BLImage instead of ImTextureID)
+        struct ImageLookupKey
+        {
+            int32_t id = -1;
+            std::pair<int, int> prefetched;
+            std::string data;
+            ImVec2 size{};
+            ImRect uvrect{ {0.f, 0.f}, {1.f, 1.f} };
+            bool hasCommonPrefetch = false;
+        };
+
+        struct GifLookupKey
+        {
+            int32_t id = -1;
+            int32_t currframe = 0;
+            int32_t totalframe = 0;
+            long long lastTime = 0;
+            ImVec2 size;
+            int* delays = nullptr;
+            std::pair<int, int> prefetched;
+            std::string data;
+            bool hasCommonPrefetch = false;
+        };
+
+        struct DebugRect
+        {
+            ImVec2 startpos;
+            ImVec2 endpos;
+            uint32_t color;
+            float thickness;
+        };
+
+        std::vector<std::pair<ImageLookupKey, BLImage>> bitmaps;
+        std::vector<std::pair<GifLookupKey, std::vector<BLImage>>> gifframes;
+        std::deque<std::pair<ImGuiWindow*, DeferredRenderer>> deferredContents;
+        std::vector<DebugRect> debugrects;
+        Vector<char, int32_t, 4096> prefetched;
+        float _currentFontSz = 0;
+        bool deferDrawCalls = false;
+
+        Blend2DRenderer()
+        { }
+
+        ~Blend2DRenderer()
+        {
+            ctx.end();
+        }
+
+        RendererType Type() const { return RendererType::Blend2D; }
+
+        bool InitFrame(float width, float height, uint32_t bgcolor, bool softCursor) override
+        {
+            int w = (int)ceilf(width);
+            int h = (int)ceilf(height);
+
+            // Resize internal buffer if necessary
+            if (renderTarget.width() != w || renderTarget.height() != h)
+            {
+                renderTarget.create(w, h, BL_FORMAT_PRGB32);
+            }
+
+            // Begin rendering context
+            ctx.begin(renderTarget);
+            ctx.set_comp_op(BL_COMP_OP_SRC_OVER);
+
+            // Clear background
+            auto [r, g, b, a] = DecomposeColor(bgcolor);
+            ctx.set_fill_style(BLRgba32(r, g, b, a));
+            ctx.fill_all();
+
+            return true;
+        }
+
+        void FinalizeFrame(int32_t cursor) override
+        {
+            if (!deferredContents.empty())
+            {
+                auto& renderer = deferredContents.back().second;
+                renderer.Render(*this, {}, 0, -1);
+                deferredContents.clear();
+            }
+
+            for (const auto& rect : debugrects)
+            {
+                auto [r, g, b, a] = DecomposeColor(rect.color);
+                ctx.set_stroke_style(BLRgba32(r, g, b, a));
+                ctx.set_stroke_width(rect.thickness);
+                ctx.stroke_rect(BLRect(rect.startpos.x, rect.startpos.y,
+                    rect.endpos.x - rect.startpos.x, rect.endpos.y - rect.startpos.y));
+            }
+
+            debugrects.clear();
+            ctx.end();
+        }
+
+        void SetClipRect(ImVec2 startpos, ImVec2 endpos, bool intersect) override
+        {
+            //ctx.save();
+            ctx.clip_to_rect(BLRect(startpos.x, startpos.y, endpos.x - startpos.x, endpos.y - startpos.y));
+        }
+
+        void ResetClipRect() override
+        {
+            ctx.restore_clipping();
+            //ctx.restore();
+        }
+
+        void BeginDefer() override
+        {
+            if (!deferDrawCalls)
+            {
+                deferDrawCalls = true;
+                deferredContents.emplace_back(nullptr, &Blend2DMeasureText);
+            }
+        }
+
+        void EndDefer() override
+        {
+            deferDrawCalls = false;
+        }
+
+        void DrawLine(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness = 1.f) override
+        {
+            if (deferDrawCalls) [[unlikely]]
+                deferredContents.back().second.DrawLine(startpos, endpos, color, thickness);
+            else
+            {
+                auto [r, g, b, a] = DecomposeColor(color);
+                ctx.set_stroke_style(BLRgba32(r, g, b, a));
+                ctx.set_stroke_width(thickness);
+                ctx.stroke_line(startpos.x, startpos.y, endpos.x, endpos.y);
+            }
+        }
+
+        void DrawPolyline(ImVec2* points, int sz, uint32_t color, float thickness) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawPolyline(points, sz, color, thickness);
+            else
+            {
+                if (sz < 2) return;
+                BLPath path;
+                path.move_to(points[0].x, points[0].y);
+                for (int i = 1; i < sz; ++i) path.line_to(points[i].x, points[i].y);
+
+                auto [r, g, b, a] = DecomposeColor(color);
+                ctx.set_stroke_style(BLRgba32(r, g, b, a));
+                ctx.set_stroke_width(thickness);
+                ctx.stroke_path(path);
+            }
+        }
+
+        void DrawTriangle(ImVec2 pos1, ImVec2 pos2, ImVec2 pos3, uint32_t color, bool filled, float thickness = 1.f) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawTriangle(pos1, pos2, pos3, color, filled, thickness);
+            else
+            {
+                BLPath path;
+                path.move_to(pos1.x, pos1.y);
+                path.line_to(pos2.x, pos2.y);
+                path.line_to(pos3.x, pos3.y);
+                path.close();
+
+                auto [r, g, b, a] = DecomposeColor(color);
+                BLRgba32 c(r, g, b, a);
+
+                if (filled)
+                {
+                    ctx.set_fill_style(c);
+                    ctx.fill_path(path);
+                }
+                else
+                {
+                    ctx.set_stroke_style(c);
+                    ctx.set_stroke_width(thickness);
+                    ctx.stroke_path(path);
+                }
+            }
+        }
+
+        void DrawRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float thickness = 1.f) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawRect(startpos, endpos, color, filled, thickness);
+            else
+            {
+                auto [r, g, b, a] = DecomposeColor(color);
+                BLRgba32 c(r, g, b, a);
+                BLRect rect(startpos.x, startpos.y, endpos.x - startpos.x, endpos.y - startpos.y);
+
+                if (filled)
+                {
+                    ctx.set_fill_style(c);
+                    ctx.fill_rect(rect);
+                }
+                else
+                {
+                    ctx.set_stroke_style(c);
+                    ctx.set_stroke_width(thickness);
+                    ctx.stroke_rect(rect);
+                }
+            }
+        }
+
+        void DrawRoundedRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float topleftr, float toprightr, float bottomrightr, float bottomleftr, float thickness = 1.f) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawRoundedRect(startpos, endpos, color, filled, topleftr,
+                    toprightr, bottomrightr, bottomleftr, thickness);
+            else
+            {
+                auto [r, g, b, a] = DecomposeColor(color);
+                BLRgba32 c(r, g, b, a);
+
+                // Check if uniform radius
+                bool uniform = (topleftr == toprightr && toprightr == bottomrightr && bottomrightr == bottomleftr);
+
+                if (uniform)
+                {
+                    BLRoundRect rr(startpos.x, startpos.y, endpos.x - startpos.x, endpos.y - startpos.y, topleftr);
+                    if (filled)
+                    {
+                        ctx.set_fill_style(c);
+                        ctx.fill_round_rect(rr);
+                    }
+                    else
+                    {
+                        ctx.set_stroke_style(c);
+                        ctx.set_stroke_width(thickness);
+                        ctx.stroke_round_rect(rr);
+                    }
+                }
+                else
+                {
+                    // Build complex path for non-uniform corners
+                    BLPath path;
+                    double w = endpos.x - startpos.x;
+                    double h = endpos.y - startpos.y;
+                    double x = startpos.x;
+                    double y = startpos.y;
+
+                    auto start = 0;
+                    double startRad = (double)start * (M_PI / 180.0);
+                    double sweepRad = M_PI / 2.f;
+
+                    path.move_to(x + topleftr, y);
+                    path.line_to(x + w - toprightr, y);
+                    if (toprightr > 0) path.arc_to(x + w - toprightr, y + toprightr, toprightr, toprightr, startRad, sweepRad);
+
+                    path.line_to(x + w, y + h - bottomrightr);
+                    startRad += sweepRad;
+                    if (bottomrightr > 0) path.arc_to(x + w - bottomrightr, y + h - bottomrightr, bottomrightr, bottomrightr, startRad, sweepRad);
+
+                    path.line_to(x + bottomleftr, y + h);
+                    startRad += sweepRad;
+                    if (bottomleftr > 0) path.arc_to(x + bottomleftr, y + h - bottomleftr, bottomleftr, bottomleftr, startRad, sweepRad);
+
+                    path.line_to(x, y + topleftr);
+                    startRad += sweepRad;
+                    if (topleftr > 0) path.arc_to(x + topleftr, y + topleftr, topleftr, topleftr, startRad, sweepRad);
+                    path.close();
+
+                    if (filled)
+                    {
+                        ctx.set_fill_style(c);
+                        ctx.fill_path(path);
+                    }
+                    else
+                    {
+                        ctx.set_stroke_style(c);
+                        ctx.set_stroke_width(thickness);
+                        ctx.stroke_path(path);
+                    }
+                }
+            }
+        }
+
+        void DrawRectGradient(ImVec2 startpos, ImVec2 endpos, uint32_t colorfrom, uint32_t colorto, Direction dir) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawRectGradient(startpos, endpos, colorfrom, colorto, dir);
+            else
+            {
+                BLGradient gradient(BL_GRADIENT_TYPE_LINEAR);
+
+                if (dir == DIR_Horizontal)
+                    gradient.set_values(BLLinearGradientValues(startpos.x, startpos.y, endpos.x, startpos.y));
+                else
+                    gradient.set_values(BLLinearGradientValues(startpos.x, startpos.y, startpos.x, endpos.y));
+
+                auto [r1, g1, b1, a1] = DecomposeColor(colorfrom);
+                auto [r2, g2, b2, a2] = DecomposeColor(colorto);
+
+                gradient.add_stop(0.0, BLRgba32(r1, g1, b1, a1));
+                gradient.add_stop(1.0, BLRgba32(r2, g2, b2, a2));
+
+                ctx.set_fill_style(gradient);
+                ctx.fill_rect(startpos.x, startpos.y, endpos.x - startpos.x, endpos.y - startpos.y);
+            }
+        }
+
+        void DrawRoundedRectGradient(ImVec2 startpos, ImVec2 endpos, float topleftr, float toprightr, float bottomrightr, float bottomleftr,
+            uint32_t colorfrom, uint32_t colorto, Direction dir) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawRoundedRectGradient(startpos, endpos, topleftr, toprightr, bottomrightr, bottomleftr, colorfrom, colorto, dir);
+            else
+            {
+                BLGradient gradient(BL_GRADIENT_TYPE_LINEAR);
+                if (dir == DIR_Horizontal)
+                    gradient.set_values(BLLinearGradientValues(startpos.x, startpos.y, endpos.x, startpos.y));
+                else
+                    gradient.set_values(BLLinearGradientValues(startpos.x, startpos.y, startpos.x, endpos.y));
+
+                auto [r1, g1, b1, a1] = DecomposeColor(colorfrom);
+                auto [r2, g2, b2, a2] = DecomposeColor(colorto);
+                gradient.add_stop(0.0, BLRgba32(r1, g1, b1, a1));
+                gradient.add_stop(1.0, BLRgba32(r2, g2, b2, a2));
+
+                // Just use uniform rect for simplicity in this snippet, effectively similar to DrawRectGradient but with rounded primitive
+                // For full non-uniform support, see DrawRoundedRect path logic
+                BLRoundRect rr(startpos.x, startpos.y, endpos.x - startpos.x, endpos.y - startpos.y, topleftr);
+                ctx.set_fill_style(gradient);
+                ctx.fill_round_rect(rr);
+            }
+        }
+
+        void DrawPolygon(ImVec2* points, int sz, uint32_t color, bool filled, float thickness = 1.f) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawPolygon(points, sz, color, filled, thickness);
+            else
+            {
+                if (sz < 3) return;
+                BLPath path;
+                path.move_to(points[0].x, points[0].y);
+                for (int i = 1; i < sz; ++i) path.line_to(points[i].x, points[i].y);
+                path.close();
+
+                auto [r, g, b, a] = DecomposeColor(color);
+                BLRgba32 c(r, g, b, a);
+
+                if (filled)
+                {
+                    ctx.set_fill_style(c);
+                    ctx.fill_path(path);
+                }
+                else
+                {
+                    ctx.set_stroke_style(c);
+                    ctx.set_stroke_width(thickness);
+                    ctx.stroke_path(path);
+                }
+            }
+        }
+
+        void DrawPolyGradient(ImVec2* points, uint32_t* colors, int sz) override 
+        { /* TODO: Complex implementation for Blend2D */ }
+
+        void DrawCircle(ImVec2 center, float radius, uint32_t color, bool filled, float thickness = 1.f) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawCircle(center, radius, color, filled, thickness);
+            else
+            {
+                auto [r, g, b, a] = DecomposeColor(color);
+                BLRgba32 c(r, g, b, a);
+                BLCircle circle(center.x, center.y, radius);
+
+                if (filled)
+                {
+                    ctx.set_fill_style(c);
+                    ctx.fill_circle(circle);
+                }
+                else
+                {
+                    ctx.set_stroke_style(c);
+                    ctx.set_stroke_width(thickness);
+                    ctx.stroke_circle(circle);
+                }
+            }
+        }
+
+        void DrawSector(ImVec2 center, float radius, int start, int end, uint32_t color, bool filled, bool inverted, float thickness = 1.f) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawSector(center, radius, start, end, color, filled, thickness);
+            else
+            {
+                BLPath path;
+                double startRad = (double)start * (M_PI / 180.0);
+                double sweepRad = ((double)end - (double)start) * (M_PI / 180.0);
+
+                path.move_to(center.x, center.y);
+                path.arc_to(center.x, center.y, radius, radius, startRad, sweepRad);
+                path.close();
+
+                auto [r, g, b, a] = DecomposeColor(color);
+                BLRgba32 c(r, g, b, a);
+
+                if (filled)
+                {
+                    ctx.set_fill_style(c);
+                    ctx.fill_path(path);
+                }
+                else
+                {
+                    ctx.set_stroke_style(c);
+                    ctx.set_stroke_width(thickness);
+                    ctx.stroke_path(path);
+                }
+            }
+        }
+
+        void DrawRadialGradient(ImVec2 center, float radius, uint32_t in, uint32_t out, int start, int end) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawRadialGradient(center, radius, in, out, start, end);
+            else
+            {
+                BLGradient gradient(BL_GRADIENT_TYPE_RADIAL);
+                gradient.set_values(BLRadialGradientValues(center.x, center.y, center.x, center.y, radius));
+
+                auto [r1, g1, b1, a1] = DecomposeColor(in);
+                auto [r2, g2, b2, a2] = DecomposeColor(out);
+
+                gradient.add_stop(0.0, BLRgba32(r1, g1, b1, a1));
+                gradient.add_stop(1.0, BLRgba32(r2, g2, b2, a2));
+
+                // Ideally use a sector arc path here, simplified to circle for full loop
+                ctx.set_fill_style(gradient);
+                ctx.fill_circle(center.x, center.y, radius);
+            }
+        }
+
+        bool SetCurrentFont(std::string_view family, float sz, FontType type) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.SetCurrentFont(family, sz, type);
+            else
+            {
+                FontExtraInfo extra;
+                font = (BLFont*)GetFont(family, sz, type, extra);
+                _currentFontSz = sz;
+            }
+            return true;
+        }
+
+        bool SetCurrentFont(void* fontptr, float sz) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.SetCurrentFont(fontptr, sz);
+            else
+            {
+                if (fontptr)
+                {
+                    font = ((BLFont*)fontptr);
+                    _currentFontSz = sz;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void ResetFont() override {}
+
+        ImVec2 GetTextSize(std::string_view text, void* fontptr, float sz, float wrapWidth = -1.f) override
+        {
+            return Blend2DMeasureText(text, fontptr, sz, wrapWidth);
+        }
+
+        void DrawText(std::string_view text, ImVec2 pos, uint32_t color, float wrapWidth = -1.f) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawText(text, pos, color, wrapWidth);
+            else
+            {
+                auto [r, g, b, a] = DecomposeColor(color);
+                ctx.set_fill_style(BLRgba32(r, g, b, a));
+                ctx.fill_utf8_text(BLPoint(pos.x, pos.y + font->metrics().ascent), *font, text.data(), text.size());
+            }
+        }
+
+        void DrawTooltip(ImVec2 pos, std::string_view text) override 
+        { 
+            // Have a tooltip deferred renderer which gets called at EndFrame() ?
+        }
+
+        float EllipsisWidth(void* fontptr, float sz) override { return 10.f; }
+
+        bool StartOverlay(int32_t id, ImVec2 pos, ImVec2 size, uint32_t color) override
+        {
+            // TODO: Implement layer mechanism
+            DrawRect(pos, pos + size, color, true);
+            SetClipRect(pos, pos + size, false);
+            return true;
+        }
+
+        void EndOverlay() override 
+        { 
+            /*if (!deferredContents.empty())
+            {
+                auto& renderer = deferredContents.back();
+                renderer.Render(*this, {}, 0, -1);
+                deferredContents.clear();
+            }*/
+
+            ResetClipRect(); 
+        }
+
+        void DrawDebugRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness) override
+        {
+            debugrects.push_back({ startpos, endpos, color, thickness });
+        }
+
+        template <typename KeyT>
+        bool MatchKey(KeyT key, int32_t id, std::string_view content)
+        {
+            return key.id == -1 || id == -1 ? key.data == content : key.id == id;
+        }
+
+        int64_t RecordImage(std::pair<ImageLookupKey, BLImage>& entry, int32_t id, ImVec2 pos, ImVec2 size, stbi_uc* data, int bufsz, bool draw)
+        {
+            int w, h, n;
+            unsigned char* pixels = stbi_load_from_memory(data, bufsz, &w, &h, &n, 4);
+            entry.first.data = std::string((char*)data, bufsz);
+            entry.first.id = id;
+            entry.first.size = size;
+
+            if (pixels && (w > 0) && (h > 0))
+            {
+                entry.second.create(w, h, BL_FORMAT_PRGB32);
+                BLImageData imgData;
+                entry.second.get_data(&imgData);
+
+                // Convert RGBA (stb) to PRGB32 (Blend2D)
+                uint8_t* src = pixels;
+                uint8_t* dst = (uint8_t*)imgData.pixel_data;
+                for (int y = 0; y < h; ++y)
+                {
+                    uint8_t* dline = dst + y * imgData.stride;
+                    uint8_t* sline = src + y * w * 4;
+                    for (int x = 0; x < w; ++x)
+                    {
+                        uint8_t r = sline[x * 4 + 0];
+                        uint8_t g = sline[x * 4 + 1];
+                        uint8_t b = sline[x * 4 + 2];
+                        uint8_t a = sline[x * 4 + 3];
+                        // Pre-multiply
+                        r = (r * a) / 255;
+                        g = (g * a) / 255;
+                        b = (b * a) / 255;
+                        // ARGB/PRGB32 layout
+                        ((uint32_t*)dline)[x] = (a << 24) | (r << 16) | (g << 8) | b;
+                    }
+                }
+                stbi_image_free(pixels);
+            }
+
+            if (draw)
+            {
+                ctx.blit_image(BLRect(pos.x, pos.y, size.x, size.y), entry.second);
+            }
+
+            return w * h * 4;
+        }
+        
+        int64_t RecordGif(std::pair<GifLookupKey, std::vector<BLImage>>& entry, int32_t id, ImVec2 pos, ImVec2 size, stbi_uc* data, int bufsz, bool draw)
+        {
+            using namespace std::chrono;
+
+            int width, height, frames, channels;
+            int* delays = nullptr;
+            auto pixels = stbi_load_gif_from_memory(data, bufsz, &delays, &width, &height, &frames, &channels, 4);
+            int64_t bytes = 0;
+
+            if (pixels != nullptr && width > 0 && height > 0 && frames > 0)
+            {
+                entry.first.id = id;
+                entry.first.data.assign((char*)data, bufsz);
+                entry.first.totalframe = frames;
+                entry.first.delays = delays;
+                entry.first.lastTime = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+                entry.first.size = ImVec2{ (float)width, (float)height };
+                entry.second.reserve(frames);
+
+                auto relw = 1.f / (float)frames;
+                auto currx = 0.f;
+
+                for (auto fidx = 0; fidx < frames; ++fidx)
+                {
+                    auto& image = entry.second.emplace_back();
+                    BLImageData imgData;
+                    image.get_data(&imgData);
+
+                    // Convert RGBA (stb) to PRGB32 (Blend2D)
+                    uint8_t* src = pixels;
+                    uint8_t* dst = (uint8_t*)imgData.pixel_data;
+                    for (int y = 0; y < height; ++y)
+                    {
+                        uint8_t* dline = dst + y * imgData.stride;
+                        uint8_t* sline = src + y * width * 4;
+                        for (int x = 0; x < width; ++x)
+                        {
+                            uint8_t r = sline[x * 4 + 0];
+                            uint8_t g = sline[x * 4 + 1];
+                            uint8_t b = sline[x * 4 + 2];
+                            uint8_t a = sline[x * 4 + 3];
+                            // Pre-multiply
+                            r = (r * a) / 255;
+                            g = (g * a) / 255;
+                            b = (b * a) / 255;
+                            // ARGB/PRGB32 layout
+                            ((uint32_t*)dline)[x] = (a << 24) | (r << 16) | (g << 8) | b;
+                        }
+                    }
+                }
+
+                if (draw)
+                {
+                    ctx.blit_image(BLRect(pos.x, pos.y, size.x, size.y), entry.second[entry.first.currframe]);
+                }
+
+                bytes = frames * width * height * 4;
+            }
+
+            stbi_image_free(pixels);
+            return bytes;
+        }
+        
+        int64_t RecordSVG(std::pair<ImageLookupKey, BLImage>& entry, int32_t id, ImVec2 pos, ImVec2 size, uint32_t color, lunasvg::Document& document, bool draw)
+        {
+            entry.first.id = id;
+            entry.first.size = size;
+            int64_t bytes = 0;
+
+            auto bitmap = document.renderToBitmap((int)size.x, (int)size.y, color);
+            bitmap.convertToRGBA();
+
+            auto pixels = bitmap.data();
+            BLImageData imgData;
+            entry.second.get_data(&imgData);
+
+            // Convert RGBA (stb) to PRGB32 (Blend2D)
+            uint8_t* src = pixels;
+            uint8_t* dst = (uint8_t*)imgData.pixel_data;
+            for (int y = 0; y < bitmap.height(); ++y)
+            {
+                uint8_t* dline = dst + y * imgData.stride;
+                uint8_t* sline = src + y * bitmap.width() * 4;
+                for (int x = 0; x < bitmap.width(); ++x)
+                {
+                    uint8_t r = sline[x * 4 + 0];
+                    uint8_t g = sline[x * 4 + 1];
+                    uint8_t b = sline[x * 4 + 2];
+                    uint8_t a = sline[x * 4 + 3];
+                    // Pre-multiply
+                    r = (r * a) / 255;
+                    g = (g * a) / 255;
+                    b = (b * a) / 255;
+                    // ARGB/PRGB32 layout
+                    ((uint32_t*)dline)[x] = (a << 24) | (r << 16) | (g << 8) | b;
+                }
+            }
+
+            if (draw)
+            {
+                ctx.blit_image(BLRect(pos.x, pos.y, size.x, size.y), entry.second);
+            }
+
+            bytes = (int64_t)size.x * (int64_t)size.y * 4;
+            return bytes;
+        }
+
+        bool DrawResource(int32_t resflags, ImVec2 pos, ImVec2 size, uint32_t color, std::string_view content, int32_t id = -1) override
+        {
+            if (deferDrawCalls) [[likely]]
+                deferredContents.back().second.DrawResource(resflags, pos, size, color, content, id);
+            else
+            {
+                BLImage* image = nullptr;
+
+                if (resflags & RT_SYMBOL)
+                {
+                    Round(pos); Round(size);
+                    auto icon = GetSymbolIcon(content);
+                    DrawSymbol(pos, size, { 0.f, 0.f }, icon, color, color, 1.f, *this);
+                }
+                else if (resflags & RT_ICON_FONT)
+                {
+#ifdef GLIMMER_ENABLE_ICON_FONT
+                    Round(pos); Round(size);
+                    SetCurrentFont(Config.iconFont, _currentFontSz);
+                    DrawText(content, pos, color);
+                    ResetFont();
+#else
+                    assert(false);
+#endif
+                }
+                else if (resflags & RT_SVG)
+                {
+#ifndef GLIMMER_DISABLE_SVG
+                    Round(pos); Round(size);
+                    auto& dl = *((ImDrawList*)UserData);
+                    bool found = false;
+
+                    for (auto& entry : bitmaps)
+                    {
+                        auto& [key, texid] = entry;
+                        if (MatchKey(key, id, content) && (key.size == size))
+                        {
+                            if (key.prefetched.second > key.prefetched.first)
+                            {
+                                auto document = lunasvg::Document::loadFromData(prefetched.data() + key.prefetched.first,
+                                    key.prefetched.second - key.prefetched.first);
+                                if (document)
+                                    RecordSVG(entry, id, pos, size, color, *document, false);
+                                else
+                                    std::fprintf(stderr, "Failed to load SVG [%.*s]\n",
+                                        key.prefetched.second - key.prefetched.first,
+                                        prefetched.data() + key.prefetched.first);
+                                key.prefetched.second = key.prefetched.first = 0;
+                            }
+
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found)
+                    {
+                        auto contents = GetResourceContents(resflags, content);
+                        if (contents.size > 0)
+                        {
+                            auto document = lunasvg::Document::loadFromData(contents.data, contents.size);
+                            if (document)
+                                RecordSVG(bitmaps.emplace_back(), id, pos, size, color, *document, true);
+                            else
+                                std::fprintf(stderr, "Failed to load SVG [%s]\n", contents.data);
+                        }
+                        FreeResource(contents);
+                    }
+#else
+                    assert(false); // Unsupported
+#endif
+                }
+                else if ((resflags & RT_PNG) || (resflags & RT_JPG) || (resflags & RT_BMP) || (resflags & RT_PSD) ||
+                    (resflags & RT_GENERIC_IMG))
+                {
+#ifndef GLIMMER_DISABLE_IMAGES
+                    Round(pos); Round(size);
+
+                    auto& dl = *((ImDrawList*)UserData);
+                    bool found = false;
+
+                    for (auto& entry : bitmaps)
+                    {
+                        auto& [key, texid] = entry;
+                        if (MatchKey(key, id, content))
+                        {
+                            if (key.prefetched.second > key.prefetched.first)
+                            {
+                                auto data = prefetched.data() + key.prefetched.first;
+                                auto sz = key.prefetched.second - key.prefetched.first;
+                                RecordImage(entry, id, pos, size, (stbi_uc*)data, sz, false);
+                                key.prefetched.second = key.prefetched.first = 0;
+                            }
+
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found)
+                    {
+                        auto contents = GetResourceContents(resflags, content);
+                        if (contents.size > 0)
+                            RecordImage(bitmaps.emplace_back(), id, pos, size,
+                                (stbi_uc*)contents.data, (int)contents.size, true);
+                        FreeResource(contents);
+                    }
+#else
+                    assert(false); // Unsupported
+#endif
+                }
+                else if (resflags & RT_GIF)
+                {
+#ifndef GLIMMER_DISABLE_GIF
+                    using namespace std::chrono;
+                    Round(pos); Round(size);
+
+                    auto& dl = *((ImDrawList*)UserData);
+                    bool found = false;
+
+                    for (auto& entry : gifframes)
+                    {
+                        auto& [key, images] = entry;
+                        if (MatchKey(key, id, content))
+                        {
+                            if (key.prefetched.second > key.prefetched.first)
+                            {
+                                auto data = prefetched.data() + key.prefetched.first;
+                                auto sz = key.prefetched.second - key.prefetched.first;
+                                RecordGif(entry, id, pos, size, (stbi_uc*)data, sz, false);
+                                key.prefetched.second = key.prefetched.first = 0;
+                            }
+
+                            if (!images.empty())
+                            {
+                                auto currts = system_clock::now().time_since_epoch();
+                                auto ms = duration_cast<milliseconds>(currts).count();
+                                if (key.delays[key.currframe] <= (ms - key.lastTime))
+                                {
+                                    key.currframe = (key.currframe + 1) % key.totalframe;
+                                    key.lastTime = ms;
+                                }
+
+                                ctx.blit_image(BLRect(pos.x, pos.y, size.x, size.y), images[key.currframe]);
+                            }
+
+                            found = true;
+                            break;
+                        }
+                    }
+
+                    if (!found)
+                    {
+                        auto contents = GetResourceContents(resflags, content);
+                        if (contents.size > 0)
+                            RecordGif(gifframes.emplace_back(), id, pos, size,
+                                (stbi_uc*)contents.data, (int)contents.size, true);
+                        FreeResource(contents);
+                    }
+#else
+                    assert(false); // Unsupported
+#endif
+                }
+            }
+
+            // TODO: return correct status
+            return true;
+        }
+
+        int64_t PreloadResources(int32_t loadflags, ResourceData* resources, int totalsz) override
+        {
+            int64_t totalBytes = 0;
+
+            for (auto idx = 0; idx < totalsz; ++idx)
+            {
+                auto contents = GetResourceContents(resources[idx].resflags, resources[idx].content);
+
+                if (resources[idx].resflags & RT_GIF)
+                {
+                    auto contents = GetResourceContents(resources[idx].resflags, resources[idx].content);
+                    if (contents.size > 0)
+                        totalBytes += RecordGif(gifframes.emplace_back(), resources[idx].id, {}, {},
+                            (stbi_uc*)contents.data, (int)contents.size, false);
+                    FreeResource(contents);
+                }
+                else if (resources[idx].resflags & RT_SVG)
+                {
+                    auto contents = GetResourceContents(resources[idx].resflags, resources[idx].content);
+                    if (contents.size > 0)
+                    {
+                        auto document = lunasvg::Document::loadFromData(contents.data, contents.size);
+                        if (document)
+                            totalBytes += RecordSVG(bitmaps.emplace_back(), resources[idx].id, {}, {},
+                                resources[idx].bgcolor, *document, false);
+                        else
+                            std::fprintf(stderr, "Failed to load SVG [%s]\n", contents.data);
+                    }
+                    FreeResource(contents);
+                }
+                else
+                {
+                    auto contents = GetResourceContents(resources[idx].resflags, resources[idx].content);
+                    if (contents.size > 0)
+                        totalBytes += RecordImage(bitmaps.emplace_back(), resources[idx].id, {}, {},
+                            (stbi_uc*)contents.data, (int)contents.size, false);
+                    FreeResource(contents);
+                }
+            }
+
+            return totalBytes;
+        }
+    };
+
+#endif
+
+#pragma endregion
+
+#pragma region TUI Renderer (using pdcurses)
+
+#if GLIMMER_TARGET_PLATFORM == GLIMMER_PLATFORM_PDCURSES
+
+    short GetAnsiColor(uint32_t c)
+    {
+        auto [r, g, b, a] = DecomposeColor(c);
+
+        bool R = r > 127;
+        bool G = g > 127;
+        bool B = b > 127;
+
+        if (R && G && B) return COLOR_WHITE;
+        if (R && G) return COLOR_YELLOW;
+        if (R && B) return COLOR_MAGENTA;
+        if (G && B) return COLOR_CYAN;
+        if (R) return COLOR_RED;
+        if (G) return COLOR_GREEN;
+        if (B) return COLOR_BLUE;
+        return COLOR_BLACK;
+    }
+
+    // Interpolate between two colors
+    uint32_t LerpColor(uint32_t c1, uint32_t c2, float t)
+    {
+        auto [r1, g1, b1, a1] = DecomposeColor(c1);
+        auto [r2, g2, b2, a2] = DecomposeColor(c2);
+
+        uint8_t r = (uint8_t)(r1 + (r2 - r1) * t);
+        uint8_t g = (uint8_t)(g1 + (g2 - g1) * t);
+        uint8_t b = (uint8_t)(b1 + (b2 - b1) * t);
+        uint8_t a = (uint8_t)(a1 + (a2 - a1) * t);
+
+        // Reconstruct (Assuming ARGB/ABGR based on platform, using generic pack here)
+        return ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+
+    struct PDCursesRenderer : public IRenderer
+    {
+        struct ClipRect { int x, y, w, h; };
+
+        // Configuration
+        bool useExtendedAscii;
+
+        // Frame State
+        WINDOW* mainWin = nullptr;
+        PANEL* mainPanel = nullptr;
+
+        // Overlay Management
+        struct OverlayContext 
+        {
+            WINDOW* win;
+            PANEL* pan;
+        };
+        std::vector<OverlayContext> overlayStack;
+
+        // Current Drawing Context
+        WINDOW* currentWin = nullptr;
+        std::vector<ClipRect> clipStack;
+        ClipRect currentClip;
+
+        // Color Management
+        std::map<uint32_t, int> colorPairs;
+        int nextPairId = 1;
+
+        // Debug
+        struct DebugRectInfo 
+        {
+            ImVec2 start;
+            ImVec2 end;
+            uint32_t color;
+            float thickness;
+        };
+        std::vector<DebugRectInfo> debugRects;
+
+        PDCursesRenderer(bool extendedAscii = true)
+            : useExtendedAscii(extendedAscii)
+        {
+            initscr();
+            cbreak();
+            noecho();
+            keypad(stdscr, TRUE);
+            curs_set(0); // Hide cursor
+            start_color();
+            use_default_colors();
+
+            // Initialize main window
+            mainWin = newwin(LINES, COLS, 0, 0);
+            mainPanel = new_panel(mainWin);
+            currentWin = mainWin;
+
+            currentClip = { 0, 0, COLS, LINES };
+        }
+
+        ~PDCursesRenderer()
+        {
+            endwin();
+        }
+
+        RendererType Type() const { return RendererType::PDCurses; }
+
+        bool ClipPoint(int x, int y)
+        {
+            int wx, wy;
+            getbegyx(currentWin, wy, wx);
+
+            if (x < currentClip.x || x >= currentClip.x + currentClip.w ||
+                y < currentClip.y || y >= currentClip.y + currentClip.h)
+                return false;
+
+            int maxy, maxx;
+            getmaxyx(currentWin, maxy, maxx);
+            int relX = x - wx;
+            int relY = y - wy;
+
+            if (relX < 0 || relX >= maxx || relY < 0 || relY >= maxy)
+                return false;
+
+            return true;
+        }
+
+        void DrawPoint(int x, int y, chtype c)
+        {
+            if (ClipPoint(x, y)) 
+            {
+                int wx, wy;
+                getbegyx(currentWin, wy, wx);
+                mvwaddch(currentWin, y - wy, x - wx, c);
+            }
+        }
+
+        // Overload for utf-8 strings (rounded corners)
+        void DrawPointStr(int x, int y, const char* str)
+        {
+            if (ClipPoint(x, y)) 
+            {
+                int wx, wy;
+                getbegyx(currentWin, wy, wx);
+                mvwaddstr(currentWin, y - wy, x - wx, str);
+            }
+        }
+
+        int GetColorPair(uint32_t color, bool isBackground)
+        {
+            // Quantize color to ANSI for keying to avoid excessive pairs
+            short ansi = GetAnsiColor(color);
+
+            // Combine ANSI color + mode into a unique key
+            // (Using 8-bit color index to form key)
+            uint32_t key = (uint32_t)ansi | (isBackground ? 0x1000 : 0);
+
+            if (colorPairs.find(key) != colorPairs.end())
+                return colorPairs[key];
+
+            if (nextPairId >= COLOR_PAIRS) return 0;
+
+            if (isBackground)
+                init_pair(nextPairId, COLOR_BLACK, ansi);
+            else
+                init_pair(nextPairId, ansi, -1);
+
+            colorPairs[key] = nextPairId;
+            return nextPairId++;
+        }
+
+        // --- Frame Lifecycle ---
+
+        bool InitFrame(float width, float height, uint32_t bgcolor, bool softCursor) override
+        {
+            currentWin = mainWin;
+            clipStack.clear();
+            currentClip = { 0, 0, COLS, LINES };
+
+            // Clear main window
+            wbkgd(mainWin, COLOR_PAIR(GetColorPair(bgcolor, true)));
+            werase(mainWin);
+
+            return true;
+        }
+
+        void FinalizeFrame(int32_t cursor) override
+        {
+            // Draw debug rects
+            for (auto& dr : debugRects)
+            {
+                ClipRect old = currentClip;
+                currentClip = { 0, 0, COLS, LINES };
+                DrawRect(dr.start, dr.end, dr.color, false, dr.thickness);
+                currentClip = old;
+            }
+            debugRects.clear();
+
+            update_panels();
+            doupdate();
+
+            for (auto& ov : overlayStack) 
+            {
+                del_panel(ov.pan);
+                delwin(ov.win);
+            }
+            overlayStack.clear();
+        }
+
+        // --- Clipping ---
+
+        void SetClipRect(ImVec2 startpos, ImVec2 endpos, bool intersect) override
+        {
+            int x = (int)startpos.x;
+            int y = (int)startpos.y;
+            int w = (int)(endpos.x - startpos.x);
+            int h = (int)(endpos.y - startpos.y);
+
+            if (intersect)
+            {
+                int ox = currentClip.x;
+                int oy = currentClip.y;
+                int ox2 = ox + currentClip.w;
+                int oy2 = oy + currentClip.h;
+
+                int nx = std::max(x, ox);
+                int ny = std::max(y, oy);
+                int nx2 = std::min(x + w, ox2);
+                int ny2 = std::min(y + h, oy2);
+
+                x = nx;
+                y = ny;
+                w = std::max(0, nx2 - nx);
+                h = std::max(0, ny2 - ny);
+            }
+
+            clipStack.push_back(currentClip);
+            currentClip = { x, y, w, h };
+        }
+
+        void ResetClipRect() override
+        {
+            if (!clipStack.empty()) 
+            {
+                currentClip = clipStack.back();
+                clipStack.pop_back();
+            }
+            else 
+            {
+                currentClip = { 0, 0, COLS, LINES };
+            }
+        }
+
+        // --- Primitives ---
+
+        void DrawLine(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness) override
+        {
+            int x0 = (int)startpos.x;
+            int y0 = (int)startpos.y;
+            int x1 = (int)endpos.x;
+            int y1 = (int)endpos.y;
+
+            int wx, wy, ww, wh;
+            getbegyx(currentWin, wy, wx);
+            getmaxyx(currentWin, wh, ww);
+
+            int ecx = std::max(currentClip.x, wx);
+            int ecy = std::max(currentClip.y, wy);
+            int ecw = std::min(currentClip.x + currentClip.w, wx + ww) - ecx;
+            int ech = std::min(currentClip.y + currentClip.h, wy + wh) - ecy;
+
+            if (ecw <= 0 || ech <= 0) return;
+
+            auto set_color = [&](bool on) {
+                int pair = GetColorPair(color, false);
+                if (on) wattron(currentWin, COLOR_PAIR(pair));
+                else wattroff(currentWin, COLOR_PAIR(pair));
+            };
+
+            // Horizontal
+            if (y0 == y1)
+            {
+                if (x0 > x1) std::swap(x0, x1);
+                if (y0 < ecy || y0 >= ecy + ech) return;
+
+                int dx0 = std::max(x0, ecx);
+                int dx1 = std::min(x1, ecx + ecw - 1);
+
+                if (dx0 <= dx1)
+                {
+                    set_color(true);
+                    mvwhline(currentWin, y0 - wy, dx0 - wx, useExtendedAscii ? ACS_HLINE : '-', dx1 - dx0 + 1);
+                    set_color(false);
+                }
+                return;
+            }
+
+            // Vertical
+            if (x0 == x1)
+            {
+                if (y0 > y1) std::swap(y0, y1);
+                if (x0 < ecx || x0 >= ecx + ecw) return;
+
+                int dy0 = std::max(y0, ecy);
+                int dy1 = std::min(y1, ecy + ech - 1);
+
+                if (dy0 <= dy1)
+                {
+                    set_color(true);
+                    mvwvline(currentWin, dy0 - wy, x0 - wx, useExtendedAscii ? ACS_VLINE : '|', dy1 - dy0 + 1);
+                    set_color(false);
+                }
+                return;
+            }
+
+            // Bresenham
+            set_color(true);
+            int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+            int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+            int err = dx + dy, e2;
+
+            while (true) 
+            {
+                DrawPoint(x0, y0, useExtendedAscii ? ACS_CKBOARD : '*');
+                if (x0 == x1 && y0 == y1) break;
+                e2 = 2 * err;
+                if (e2 >= dy) { err += dy; x0 += sx; }
+                if (e2 <= dx) { err += dx; y0 += sy; }
+            }
+            set_color(false);
+        }
+
+        void DrawPolyline(ImVec2* points, int sz, uint32_t color, float thickness) override
+        {
+            if (sz < 2) return;
+            for (int i = 0; i < sz - 1; ++i) DrawLine(points[i], points[i + 1], color, thickness);
+        }
+
+        void DrawTriangle(ImVec2 pos1, ImVec2 pos2, ImVec2 pos3, uint32_t color, bool filled, float thickness) override { /* Ignored */ }
+
+        void DrawRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float thickness) override
+        {
+            int x1 = (int)startpos.x;
+            int y1 = (int)startpos.y;
+            int x2 = (int)endpos.x;
+            int y2 = (int)endpos.y;
+
+            if (filled)
+            {
+                int pair = GetColorPair(color, true);
+                wattron(currentWin, COLOR_PAIR(pair));
+                for (int y = y1; y < y2; ++y)
+                    for (int x = x1; x < x2; ++x)
+                        DrawPoint(x, y, ' ');
+                wattroff(currentWin, COLOR_PAIR(pair));
+            }
+            else
+            {
+                // Draw Outline
+                if (useExtendedAscii)
+                {
+                    int w = x2 - x1;
+                    int h = y2 - y1;
+                    if (w <= 0 || h <= 0) return;
+
+                    wattron(currentWin, COLOR_PAIR(GetColorPair(color, false)));
+
+                    // Draw Corners
+                    DrawPoint(x1, y1, ACS_ULCORNER);
+                    DrawPoint(x2 - 1, y1, ACS_URCORNER);
+                    DrawPoint(x1, y2 - 1, ACS_LLCORNER);
+                    DrawPoint(x2 - 1, y2 - 1, ACS_LRCORNER);
+
+                    // Draw Sides (Inset from corners)
+                    if (w > 2) 
+                    {
+                        DrawLine({ (float)x1 + 1, (float)y1 }, { (float)x2 - 2, (float)y1 }, color, thickness); // Top
+                        DrawLine({ (float)x1 + 1, (float)y2 - 1 }, { (float)x2 - 2, (float)y2 - 1 }, color, thickness); // Bottom
+                    }
+                    if (h > 2) 
+                    {
+                        DrawLine({ (float)x1, (float)y1 + 1 }, { (float)x1, (float)y2 - 2 }, color, thickness); // Left
+                        DrawLine({ (float)x2 - 1, (float)y1 + 1 }, { (float)x2 - 1, (float)y2 - 2 }, color, thickness); // Right
+                    }
+
+                    wattroff(currentWin, COLOR_PAIR(GetColorPair(color, false)));
+                }
+                else
+                {
+                    // Fallback to simple lines
+                    DrawLine({ (float)x1, (float)y1 }, { (float)x2 - 1, (float)y1 }, color, thickness);
+                    DrawLine({ (float)x1, (float)y2 - 1 }, { (float)x2 - 1, (float)y2 - 1 }, color, thickness);
+                    DrawLine({ (float)x1, (float)y1 }, { (float)x1, (float)y2 - 1 }, color, thickness);
+                    DrawLine({ (float)x2 - 1, (float)y1 }, { (float)x2 - 1, (float)y2 - 1 }, color, thickness);
+                }
+            }
+        }
+
+        void DrawRoundedRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, bool filled, float topleftr, float toprightr, float bottomrightr, float bottomleftr, float thickness) override
+        {
+            if (filled || !useExtendedAscii)
+            {
+                // Fill not supported for rounded, fallback to standard rect
+                DrawRect(startpos, endpos, color, filled, thickness);
+                return;
+            }
+
+            int x1 = (int)startpos.x;
+            int y1 = (int)startpos.y;
+            int x2 = (int)endpos.x;
+            int y2 = (int)endpos.y;
+            int w = x2 - x1;
+            int h = y2 - y1;
+
+            if (w <= 0 || h <= 0) return;
+
+            wattron(currentWin, COLOR_PAIR(GetColorPair(color, false)));
+
+            // Draw UTF-8 Corners
+            DrawPointStr(x1, y1, "\u256D"); // ╭
+            DrawPointStr(x2 - 1, y1, "\u256E"); // ╮
+            DrawPointStr(x1, y2 - 1, "\u2570"); // ╰
+            DrawPointStr(x2 - 1, y2 - 1, "\u256F"); // ╯
+
+            wattroff(currentWin, COLOR_PAIR(GetColorPair(color, false)));
+
+            // Connect with lines (same as DrawRect)
+            if (w > 2) 
+            {
+                DrawLine({ (float)x1 + 1, (float)y1 }, { (float)x2 - 2, (float)y1 }, color, thickness);
+                DrawLine({ (float)x1 + 1, (float)y2 - 1 }, { (float)x2 - 2, (float)y2 - 1 }, color, thickness);
+            }
+            if (h > 2) 
+            {
+                DrawLine({ (float)x1, (float)y1 + 1 }, { (float)x1, (float)y2 - 2 }, color, thickness);
+                DrawLine({ (float)x2 - 1, (float)y1 + 1 }, { (float)x2 - 1, (float)y2 - 2 }, color, thickness);
+            }
+        }
+
+        void DrawRectGradient(ImVec2 startpos, ImVec2 endpos, uint32_t colorfrom, uint32_t colorto, Direction dir) override
+        {
+            int x1 = (int)startpos.x;
+            int y1 = (int)startpos.y;
+            int x2 = (int)endpos.x;
+            int y2 = (int)endpos.y;
+
+            int w = x2 - x1;
+            int h = y2 - y1;
+            if (w <= 0 || h <= 0) return;
+
+            for (int y = y1; y < y2; ++y)
+            {
+                for (int x = x1; x < x2; ++x)
+                {
+                    float t = 0.0f;
+                    if (dir == DIR_Horizontal)
+                        t = (float)(x - x1) / (float)w;
+                    else
+                        t = (float)(y - y1) / (float)h;
+
+                    // Clamp t
+                    if (t < 0.0f) t = 0.0f;
+                    if (t > 1.0f) t = 1.0f;
+
+                    uint32_t c = LerpColor(colorfrom, colorto, t);
+                    int pair = GetColorPair(c, true);
+
+                    wattron(currentWin, COLOR_PAIR(pair));
+                    DrawPoint(x, y, ' ');
+                    wattroff(currentWin, COLOR_PAIR(pair));
+                }
+            }
+        }
+
+        void DrawRoundedRectGradient(ImVec2 startpos, ImVec2 endpos, float topleftr, float toprightr, float bottomrightr, float bottomleftr, uint32_t colorfrom, uint32_t colorto, Direction dir) override
+        {
+            // Fallback to rect gradient
+            DrawRectGradient(startpos, endpos, colorfrom, colorto, dir);
+        }
+
+        void DrawPolygon(ImVec2* points, int sz, uint32_t color, bool filled, float thickness) override
+        {
+            // ignored...
+        }
+
+        void DrawPolyGradient(ImVec2* points, uint32_t* colors, int sz) override {}
+        void DrawCircle(ImVec2 center, float radius, uint32_t color, bool filled, float thickness) override { /* Ignored */ }
+        void DrawSector(ImVec2 center, float radius, int start, int end, uint32_t color, bool filled, bool inverted, float thickness) override { /* Ignored */ }
+        void DrawRadialGradient(ImVec2 center, float radius, uint32_t in, uint32_t out, int start, int end) override { /* Ignored */ }
+
+        // --- Text ---
+
+        bool SetCurrentFont(std::string_view family, float sz, FontType type) override { return true; }
+        bool SetCurrentFont(void* fontptr, float sz) override { return true; }
+        void ResetFont() override {}
+
+        ImVec2 GetTextSize(std::string_view text, void* fontptr, float sz, float wrapWidth) override
+        {
+            return ImVec2((float)text.size(), 1.0f);
+        }
+
+        void DrawText(std::string_view text, ImVec2 pos, uint32_t color, float wrapWidth) override
+        {
+            int x = (int)pos.x;
+            int y = (int)pos.y;
+
+            // Text Clipping
+            // Check vertical bounds
+            if (y < currentClip.y || y >= currentClip.y + currentClip.h) return;
+
+            // Calculate visible substring
+            int startX = x;
+            int endX = x + (int)text.size();
+
+            int clipMinX = currentClip.x;
+            int clipMaxX = currentClip.x + currentClip.w;
+
+            if (endX <= clipMinX || startX >= clipMaxX) return;
+
+            int visibleStart = std::max(startX, clipMinX);
+            int visibleEnd = std::min(endX, clipMaxX);
+            int offset = visibleStart - startX;
+            int len = visibleEnd - visibleStart;
+
+            if (len <= 0) return;
+
+            // Prepare substring
+            auto sub = text.substr(offset, len);
+
+            // Draw
+            int wx, wy;
+            getbegyx(currentWin, wy, wx); // Window abs pos
+
+            // Note: mvwaddnstr takes relative coords
+            int relY = y - wy;
+            int relX = visibleStart - wx;
+
+            // Bounds check relative to window
+            int maxy, maxx;
+            getmaxyx(currentWin, maxy, maxx);
+            if (relY < 0 || relY >= maxy || relX >= maxx) return; // Should be handled by ClipPoint logic basically
+
+            wattron(currentWin, COLOR_PAIR(GetColorPair(color, false)));
+            mvwaddnstr(currentWin, relY, relX, sub.c_str(), len);
+            wattroff(currentWin, COLOR_PAIR(GetColorPair(color, false)));
+        }
+
+        void DrawTooltip(ImVec2 pos, std::string_view text) override
+        {
+            // Tooltip is effectively an overlay in this TUI context
+            // Approximate size
+            ImVec2 size = { (float)text.size() + 2, 3.0f };
+            StartOverlay(-1, pos, size, 0xFFFFFFFF); // White bg?
+            // Draw Box
+            DrawRect(pos, { pos.x + size.x, pos.y + size.y }, 0xFF000000, false, 1.f);
+            DrawText(text, { pos.x + 1, pos.y + 1 }, 0xFF000000);
+            EndOverlay();
+        }
+
+        float EllipsisWidth(void* fontptr, float sz) override { return 3.0f; }
+
+        // --- Overlays & Panels ---
+
+        bool StartOverlay(int32_t id, ImVec2 pos, ImVec2 size, uint32_t color) override
+        {
+            int h = (int)size.y;
+            int w = (int)size.x;
+            int y = (int)pos.y;
+            int x = (int)pos.x;
+
+            // Create new window and panel
+            WINDOW* win = newwin(h, w, y, x);
+            if (!win) return false;
+
+            PANEL* pan = new_panel(win);
+
+            // Set background for this overlay
+            wbkgd(win, COLOR_PAIR(GetColorPair(color, true)));
+            werase(win); // Apply bg
+
+            overlayStack.push_back({ win, pan });
+            currentWin = win; // Switch context
+
+            return true;
+        }
+
+        void EndOverlay() override
+        {
+            // Context reverts to main or previous overlay
+            // Note: We do NOT destroy the panel here, it must persist until update_panels() in FinalizeFrame
+            if (overlayStack.size() > 1) 
+            {
+                // If we have nested overlays, go back to previous
+                // But wait, overlayStack stores all overlays created this frame.
+                // We need to know which one was "active" before this one.
+                // Assuming strict stack usage:
+                currentWin = overlayStack[overlayStack.size() - 2].win;
+            }
+            else 
+            {
+                currentWin = mainWin;
+            }
+        }
+
+        bool DrawResource(int32_t resflags, ImVec2 pos, ImVec2 size, uint32_t color, std::string_view content, int32_t id) override { return false; }
+        int64_t PreloadResources(int32_t loadflags, ResourceData* resources, int totalsz) override { return 0; }
+
+        void DrawDebugRect(ImVec2 startpos, ImVec2 endpos, uint32_t color, float thickness) override
+        {
+            debugRects.push_back({ startpos, endpos, color, thickness });
+        }
+    };
+
+    IRenderer* CreatePDCursesRenderer()
+    {
+        static thread_local PDCursesRenderer renderer{ true };
+        return &renderer;
+    }
+
+#endif
+
+#pragma endregion
+
+    IRenderer* CreateDeferredRenderer()
+    {
+        static thread_local DeferredRenderer renderer{
+#ifndef GLIMMER_DISABLE_BLEND2D_RENDERER
+            Config.renderer->Type() == RendererType::ImGui ? &ImGuiMeasureText : &Blend2DMeasureText 
+#else
+            &ImGuiMeasureText
+#endif
+        };
+        return &renderer;
+    }
+
+    IRenderer* CreateImGuiRenderer()
+    {
+        static thread_local ImGuiRenderer renderer{};
+        return &renderer;
+    }
+
+    IRenderer* CreateSoftwareRenderer()
+    {
+#ifndef GLIMMER_DISABLE_BLEND2D_RENDERER
+        static thread_local Blend2DRenderer renderer{};
+#else
+        static thread_local ImGuiRenderer renderer{};
+#endif
+		return &renderer;
+    }
+
+    IRenderer* CreateSVGRenderer(TextMeasureFuncT tmfunc, ImVec2 dimensions)
+    {
+        static thread_local SVGRenderer renderer(tmfunc, dimensions);
+        return &renderer;
+    }
+}
