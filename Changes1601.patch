@@ -1,0 +1,1457 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 77ce895..91e9a5f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -66,6 +66,7 @@ option(GLIMMER_DISABLE_RICHTEXT "Disable rich text rendering" OFF)
+ option(GLIMMER_DISABLE_PLOTS "Disable plotting/graph library integration" OFF)
+ option(GLIMMER_ENABLE_NFDEXT "Enable nfd-extended library for file pickers" OFF)
+ option(GLIMMER_ENABLE_BLEND2D "Enable Blend2D renderer (requires libblend2d.a)" OFF)
++option(GLIMMER_FORCE_UPDATE "Force dependency refresh (from build.sh)" OFF)
+ 
+ # Configure compile definitions
+ add_compile_definitions(${PLATFORM_DEFINE})
+@@ -95,6 +96,10 @@ if(NOT GLIMMER_ENABLE_BLEND2D)
+     add_compile_definitions(GLIMMER_DISABLE_BLEND2D_RENDERER)
+ endif()
+ 
++if(GLIMMER_FORCE_UPDATE)
++    add_compile_definitions(GLIMMER_FORCE_UPDATE)
++endif()
++
+ # ImRichText target is always ImGui in Glimmer
+ add_compile_definitions(IM_RICHTEXT_TARGET_IMGUI)
+ 
+@@ -122,16 +127,16 @@ if(NOT GLIMMER_DISABLE_RICHTEXT)
+     )
+ endif()
+ 
+-# Platform-specific implementation sources
++# Platform-specific implementation sources (from downloaded ImGui backends)
+ if(GLIMMER_PLATFORM STREQUAL "sdl3")
+     list(APPEND EXTRA_SOURCES
+-        src/libs/src/imgui_impl_sdl3.cpp
+-        src/libs/src/imgui_impl_opengl3.cpp
++        src/libs/inc/imgui/backends/imgui_impl_sdl3.cpp
++        src/libs/inc/imgui/backends/imgui_impl_opengl3.cpp
+     )
+ elseif(GLIMMER_PLATFORM STREQUAL "glfw")
+     list(APPEND EXTRA_SOURCES
+-        src/libs/src/imgui_impl_glfw.cpp
+-        src/libs/src/imgui_impl_opengl3.cpp
++        src/libs/inc/imgui/backends/imgui_impl_glfw.cpp
++        src/libs/inc/imgui/backends/imgui_impl_opengl3.cpp
+     )
+ endif()
+ 
+@@ -143,6 +148,12 @@ set(ALL_SOURCES ${GLIMMER_SOURCES} ${EXTRA_SOURCES})
+ #==============================================================================
+ add_library(${LIBRARY_NAME} STATIC ${ALL_SOURCES})
+ 
++# Define ImGui with FreeType and 32-bit Unicode support (for emoji)
++target_compile_definitions(${LIBRARY_NAME} PRIVATE 
++    IMGUI_ENABLE_FREETYPE
++    IMGUI_USE_WCHAR32
++)
++
+ #==============================================================================
+ # Include Directories
+ #==============================================================================
+@@ -339,6 +350,7 @@ message(STATUS "  Disable RichText: ${GLIMMER_DISABLE_RICHTEXT}")
+ message(STATUS "  Disable Plots: ${GLIMMER_DISABLE_PLOTS}")
+ message(STATUS "  Enable NFD-Ext: ${GLIMMER_ENABLE_NFDEXT}")
+ message(STATUS "  Enable Blend2D: ${GLIMMER_ENABLE_BLEND2D}")
++message(STATUS "  Force Update: ${GLIMMER_FORCE_UPDATE}")
+ message(STATUS "")
+ message(STATUS "Output: ${CMAKE_CURRENT_SOURCE_DIR}/staticlib/lib${LIBRARY_NAME}.a")
+ message(STATUS "========================================")
+diff --git a/build.sh b/build.sh
+index ca1aeb5..ceeac8b 100755
+--- a/build.sh
++++ b/build.sh
+@@ -48,6 +48,7 @@ BUILD_TYPE="Release"
+ CLEAN_BUILD=false
+ PLATFORM="sdl3"  # Default platform
+ BUILD_DEPS=true  # Auto-build dependencies
++UPDATE_ALL=false # Force re-download/rebuild/copy of dependencies
+ ENABLE_SVG=""
+ ENABLE_IMAGES=""
+ ENABLE_RICHTEXT=""
+@@ -68,6 +69,7 @@ print_usage() {
+     echo "  -d, --debug             Build in Debug mode (with debug symbols)"
+     echo "  -c, --clean             Clean build directory before building"
+     echo "  --no-deps               Don't auto-build dependencies"
++    echo "  --update                Force re-download/rebuild/copy deps"
+     echo ""
+     echo "Feature Overrides (skip cloning/building if disabled):"
+     echo "  --disable-svg           Disable SVG (skip plutovg/lunasvg)"
+@@ -122,6 +124,10 @@ while [[ $# -gt 0 ]]; do
+             BUILD_DEPS=false
+             shift
+             ;;
++        --update)
++            UPDATE_ALL=true
++            shift
++            ;;
+         --disable-svg)
+             ENABLE_SVG="false"
+             shift
+@@ -215,6 +221,10 @@ if [ "$BUILD_DEPS" = true ]; then
+         DEP_FLAGS="$DEP_FLAGS --disable-images"
+     fi
+     
++    if [ "$UPDATE_ALL" = true ]; then
++        DEP_FLAGS="$DEP_FLAGS --update"
++    fi
++
+     # Check for icon font disable (need to add this flag)
+     if [[ "$*" == *"--disable-icon-font"* ]]; then
+         DEP_FLAGS="$DEP_FLAGS --disable-icon-font"
+@@ -243,6 +253,9 @@ cd "$BUILD_DIR"
+ # Prepare CMake options (pass platform to CMake)
+ CMAKE_OPTIONS="-DCMAKE_BUILD_TYPE=$BUILD_TYPE"
+ CMAKE_OPTIONS="$CMAKE_OPTIONS -DGLIMMER_PLATFORM=$PLATFORM"
++if [ "$UPDATE_ALL" = true ]; then
++    CMAKE_OPTIONS="$CMAKE_OPTIONS -DGLIMMER_FORCE_UPDATE=ON"
++fi
+ 
+ # Set platform-specific defaults if not overridden
+ case $PLATFORM in
+diff --git a/build_dependencies.sh b/build_dependencies.sh
+index 851f602..765e55f 100755
+--- a/build_dependencies.sh
++++ b/build_dependencies.sh
+@@ -49,41 +49,53 @@ NC='\033[0m' # No Color
+ #==============================================================================
+ 
+ # Font rendering
+-FREETYPE_VERSION="2.13.3"
+-FREETYPE_URL="https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.gz"
++FREETYPE_VERSION="2.14.1"
++FREETYPE_URL="https://gitlab.freedesktop.org/freetype/freetype/-/archive/VER-2-14-1/freetype-VER-2-14-1.tar.gz?ref_type=tags"
++
++# ImGui core library
++IMGUI_VERSION="1.92.5"
++IMGUI_URL="https://github.com/ocornut/imgui/archive/refs/tags/v${IMGUI_VERSION}.tar.gz"
++
++# ImGui plotting extension
++IMPLOT_VERSION="0.17"
++IMPLOT_URL="https://github.com/epezent/implot/archive/refs/tags/v${IMPLOT_VERSION}.tar.gz"
+ 
+ # SVG libraries
+-PLUTOVG_VERSION="0.0.5"
+-PLUTOVG_URL=""
++PLUTOVG_VERSION="1.3.2"
++PLUTOVG_URL="https://github.com/sammycage/plutovg/archive/refs/tags/v${PLUTOVG_VERSION}.tar.gz"
+ 
+-LUNASVG_VERSION="3.0.1"
+-LUNASVG_URL="="
++LUNASVG_VERSION="3.5.0"
++LUNASVG_URL="https://github.com/sammycage/lunasvg/archive/refs/tags/v${LUNASVG_VERSION}.tar.gz"
++
++# Layout engine
++YOGA_VERSION="3.2.1"
++YOGA_URL="https://github.com/facebook/yoga/archive/refs/tags/v${YOGA_VERSION}.tar.gz"
+ 
+ # Platform backends
+-SDL3_VERSION="3.1.6"
+-SDL3_URL=""
++SDL3_VERSION="3.4.0"
++SDL3_URL="https://github.com/libsdl-org/SDL/archive/refs/tags/release-${SDL3_VERSION}.tar.gz"
+ 
+ GLFW_VERSION="3.4"
+-GLFW_URL=""
++GLFW_URL="https://github.com/glfw/glfw/archive/refs/tags/${GLFW_VERSION}.tar.gz"
+ 
+ # 2D rendering engine
+-BLEND2D_VERSION="0.11.0"
+-BLEND2D_URL=""
++BLEND2D_VERSION="0.21.2"
++BLEND2D_URL="https://blend2d.com/download/blend2d-${BLEND2D_VERSION}.tar.gz"
+ 
+ ASMJIT_VERSION="2024-11-18"
+-ASMJIT_URL=""
++ASMJIT_URL="https://github.com/asmjit/asmjit/archive/refs/tags/${ASMJIT_VERSION}.tar.gz"
+ 
+ # File dialogs
+-NFD_VERSION="v1.3.1"
+-NFD_URL=""
++NFD_VERSION="1.3.0"
++NFD_URL="https://github.com/btzy/nativefiledialog-extended/archive/refs/tags/v${NFD_VERSION}.tar.gz"
+ 
+ # Terminal UI
+ PDCURSES_VERSION="3.9"
+-PDCURSES_URL=""
++PDCURSES_URL="https://github.com/wmcbrine/PDCurses/archive/refs/tags/${PDCURSES_VERSION}.tar.gz"
+ 
+-# JSON support
+-JSON_VERSION="3.11.3"
+-JSON_URL=""
++# JSON support (full archive, not just header)
++JSON_VERSION="3.12.0"
++JSON_URL="https://github.com/nlohmann/json/archive/refs/tags/v${JSON_VERSION}.tar.gz"
+ 
+ # Header-only libraries
+ ICONFONT_URL="https://github.com/juliettef/IconFontCppHeaders/archive/refs/heads/main.zip"
+@@ -95,6 +107,7 @@ STB_IMAGE_URL="https://raw.githubusercontent.com/nothings/stb/master/stb_image.h
+ BUILD_TYPE="Release"
+ LIB_SUBDIR="release"
+ PLATFORM="sdl3"  # Default platform
++UPDATE_ALL=false # Force re-download/rebuild/copy
+ 
+ # Feature flags (auto-detected from platform, or explicitly set)
+ ENABLE_PLOTS=""
+@@ -113,6 +126,7 @@ print_usage() {
+     echo "  -h, --help              Show this help message"
+     echo "  -r, --release           Build in Release mode (optimized, default)"
+     echo "  -d, --debug             Build in Debug mode (with debug symbols)"
++    echo "  --update                Force re-download/rebuild/copy even if present"
+     echo ""
+     echo "Feature Options (override platform defaults):"
+     echo "  --disable-plots         Skip implot (no downloading/building)"
+@@ -165,6 +179,10 @@ while [[ $# -gt 0 ]]; do
+             LIB_SUBDIR="debug"
+             shift
+             ;;
++        --update)
++            UPDATE_ALL=true
++            shift
++            ;;
+         --disable-plots)
+             ENABLE_PLOTS="false"
+             shift
+@@ -206,6 +224,7 @@ echo -e "${BLUE}Building Glimmer Dependencies${NC}"
+ echo -e "${BLUE}========================================${NC}"
+ echo -e "${GREEN}Platform: $PLATFORM${NC}"
+ echo -e "${GREEN}Build Type: $BUILD_TYPE${NC}"
++echo -e "${GREEN}Update Mode: $UPDATE_ALL${NC}"
+ echo -e "${GREEN}Output Dir: $PROJECT_ROOT/src/libs/lib/linux/$LIB_SUBDIR/$PLATFORM/${NC}"
+ echo -e "${BLUE}========================================${NC}"
+ echo ""
+@@ -344,10 +363,16 @@ EOF
+ CURRENT_LIB=0
+ 
+ # ==============================================================================
+-# BUILD ORDER:
+-#   1. FreeType (common dependency, build first)
+-#   2. SDL3/GLFW (platform backend, build second based on platform)
+-#   3. Everything else (ImGui, ImPlot, Yoga, PlutoVG, LunaSVG, Blend2D, etc.)
++# BUILD ORDER (Optimized Dependency Chain):
++#   1. FreeType + Yoga          (Core dependencies - fonts & layout)
++#   2. PlutoVG                  (SVG vector rendering)
++#   3. LunaSVG                  (SVG parsing - depends on PlutoVG)
++#   4. Platform Backends:
++#      - SDL3 + Blend2D         (for --platform=sdl3)
++#      - GLFW + nfd-ext         (for --platform=glfw)
++#      - PDCurses               (for --platform=tui)
++#   5. ImGui + Backend          (GUI after platform is ready)
++#   6. ImPlot                   (Plotting after ImGui)
+ # ==============================================================================
+ 
+ # ==============================================================================
+@@ -357,13 +382,16 @@ if [ "$BUILD_FREETYPE" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building freetype v${FREETYPE_VERSION}... (BUILD FIRST)${NC}"
+ cd "$BUILD_DIR"
+-if [ -f "$LIB_OUTPUT_DIR/libfreetype.a" ]; then
++if [ -f "$LIB_OUTPUT_DIR/libfreetype.a" ] && [ "$UPDATE_ALL" != true ]; then
+     echo -e "${YELLOW}✓ libfreetype.a already exists, skipping build${NC}"
+     ls -lh "$LIB_OUTPUT_DIR/libfreetype.a"
+         LIBS_SKIPPED+=("FreeType v${FREETYPE_VERSION}")
+     else
+         LIBS_BUILT+=("FreeType v${FREETYPE_VERSION}")
+-        FREETYPE_DIR="freetype-${FREETYPE_VERSION}"
++        FREETYPE_DIR="freetype-VER-${FREETYPE_VERSION//./-}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$FREETYPE_DIR"
++        fi
+         if [ ! -d "$FREETYPE_DIR" ]; then
+             echo -e "${YELLOW}Downloading freetype v${FREETYPE_VERSION}...${NC}"
+             $DOWNLOAD_CMD freetype.tar.gz $FREETYPE_URL
+@@ -391,7 +419,7 @@ if [ -f "$LIB_OUTPUT_DIR/libfreetype.a" ]; then
+     fi
+         
+         # Copy headers (check if already copied for this version)
+-        if grep -q "FreeType: v${FREETYPE_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/freetype2" ] && [ "$(ls -A $HEADER_DIR/freetype2 2>/dev/null)" ]; then
++        if [ "$UPDATE_ALL" != true ] && grep -q "FreeType: v${FREETYPE_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/freetype2" ] && [ "$(ls -A $HEADER_DIR/freetype2 2>/dev/null)" ]; then
+             echo -e "${YELLOW}✓ FreeType v${FREETYPE_VERSION} headers already installed, skipping copy${NC}"
+             HEADERS_SKIPPED+=("FreeType v${FREETYPE_VERSION}")
+         else
+@@ -415,7 +443,180 @@ echo ""
+ fi
+ 
+ # ==============================================================================
+-# 2. Build SDL3/GLFW SECOND (platform backend, based on platform option)
++# 2. Build Yoga (flexbox layout engine - ALWAYS REQUIRED)
++# ==============================================================================
++if [ "$BUILD_YOGA" = true ]; then
++    CURRENT_LIB=$((CURRENT_LIB+1))
++    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building Yoga v${YOGA_VERSION}... (BUILD SECOND - LAYOUT ENGINE)${NC}"
++if [ -f "$LIB_OUTPUT_DIR/libyogacore.a" ] && [ "$UPDATE_ALL" != true ]; then
++    echo -e "${YELLOW}✓ libyogacore.a already exists, skipping build${NC}"
++    ls -lh "$LIB_OUTPUT_DIR/libyogacore.a"
++        LIBS_SKIPPED+=("Yoga v${YOGA_VERSION}")
++    else
++        LIBS_BUILT+=("Yoga v${YOGA_VERSION}")
++        cd "$BUILD_DIR"
++        
++        YOGA_DIR="yoga-${YOGA_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$YOGA_DIR"
++        fi
++        if [ ! -d "$YOGA_DIR" ]; then
++            echo -e "${YELLOW}Downloading Yoga v${YOGA_VERSION}...${NC}"
++            $DOWNLOAD_CMD yoga.tar.gz "$YOGA_URL"
++            tar -xzf yoga.tar.gz
++            rm yoga.tar.gz
++        else
++            echo -e "${YELLOW}Yoga v${YOGA_VERSION} source found, building...${NC}"
++        fi
++        
++        cd "$YOGA_DIR"
++        
++        # Build Yoga (only core library files, exclude bindings and tests)
++        echo -e "${YELLOW}Building Yoga from source...${NC}"
++        find . -name "*.cpp" \
++            -not -path "*/tests/*" \
++            -not -path "*/benchmark/*" \
++            -not -path "*/capture/*" \
++            -not -path "*/fuzz/*" \
++            -not -path "*/java/*" \
++            -not -path "*/javascript/*" \
++            -exec g++ -c -std=c++20 $CFLAGS {} -I. -Iyoga \;
++        ar rcs libyogacore.a *.o
++        cp libyogacore.a "$LIB_OUTPUT_DIR/"
++        rm -f *.o
++        
++        # Copy headers
++        if [ "$UPDATE_ALL" != true ] && grep -q "Yoga: v${YOGA_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/yoga" ] && [ "$(ls -A $HEADER_DIR/yoga 2>/dev/null)" ]; then
++            echo -e "${YELLOW}✓ Yoga v${YOGA_VERSION} headers already installed, skipping copy${NC}"
++            HEADERS_SKIPPED+=("Yoga v${YOGA_VERSION}")
++        else
++            echo -e "${YELLOW}Copying Yoga v${YOGA_VERSION} headers...${NC}"
++            HEADERS_COPIED+=("Yoga v${YOGA_VERSION}")
++            mkdir -p "$HEADER_DIR/yoga"
++            cp -r yoga/*.h "$HEADER_DIR/yoga/" 2>/dev/null || true
++            echo -e "${GREEN}✓ Headers copied${NC}"
++        fi
++        
++        # Track version
++        grep -q "Yoga: v${YOGA_VERSION}" "$VERSION_FILE" 2>/dev/null || echo "Yoga: v${YOGA_VERSION}" >> "$VERSION_FILE"
++        
++        echo -e "${GREEN}✓ Yoga built successfully (headers copied)${NC}"
++        ls -lh "$LIB_OUTPUT_DIR/libyogacore.a"
++        cd "$BUILD_DIR"
++fi
++echo ""
++fi
++
++# ==============================================================================
++# 3. Build PlutoVG (SVG vector rendering)
++# ==============================================================================
++if [ "$BUILD_PLUTOVG" = true ]; then
++    CURRENT_LIB=$((CURRENT_LIB+1))
++    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building plutosvg v${PLUTOVG_VERSION}... (BUILD THIRD - SVG RENDERING)${NC}"
++if [ -f "$LIB_OUTPUT_DIR/libplutovg.a" ] && [ "$UPDATE_ALL" != true ]; then
++    echo -e "${YELLOW}✓ libplutovg.a already exists, skipping build${NC}"
++    ls -lh "$LIB_OUTPUT_DIR/libplutovg.a"
++        LIBS_SKIPPED+=("PlutoVG v${PLUTOVG_VERSION}")
++    else
++        LIBS_BUILT+=("PlutoVG v${PLUTOVG_VERSION}")
++        PLUTOVG_DIR="plutovg-${PLUTOVG_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$PLUTOVG_DIR"
++        fi
++        if [ ! -d "$PLUTOVG_DIR" ]; then
++            echo -e "${YELLOW}Downloading plutovg v${PLUTOVG_VERSION}...${NC}"
++            $DOWNLOAD_CMD plutovg.tar.gz "$PLUTOVG_URL"
++            tar -xzf plutovg.tar.gz
++            rm plutovg.tar.gz
++        else
++            echo -e "${YELLOW}plutovg v${PLUTOVG_VERSION} source found, building...${NC}"
++        fi
++        cd "$PLUTOVG_DIR"
++    rm -rf build
++    mkdir build && cd build
++    cmake .. -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBUILD_SHARED_LIBS=OFF
++    make -j$(nproc)
++    cp libplutovg.a "$LIB_OUTPUT_DIR/"
++        
++        # Copy headers (check if already copied for this version)
++        if [ "$UPDATE_ALL" != true ] && grep -q "PlutoVG: v${PLUTOVG_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/plutovg" ] && [ "$(ls -A $HEADER_DIR/plutovg 2>/dev/null)" ]; then
++            echo -e "${YELLOW}✓ PlutoVG v${PLUTOVG_VERSION} headers already installed, skipping copy${NC}"
++            HEADERS_SKIPPED+=("PlutoVG v${PLUTOVG_VERSION}")
++        else
++            echo -e "${YELLOW}Copying plutovg v${PLUTOVG_VERSION} headers...${NC}"
++            HEADERS_COPIED+=("PlutoVG v${PLUTOVG_VERSION}")
++            cd ..
++            mkdir -p "$HEADER_DIR/plutovg"
++            cp -r include/* "$HEADER_DIR/plutovg/" 2>/dev/null || cp *.h "$HEADER_DIR/plutovg/" 2>/dev/null || true
++            echo -e "${GREEN}✓ Headers copied${NC}"
++        fi
++        
++        # Track version
++        grep -q "PlutoVG: v${PLUTOVG_VERSION}" "$VERSION_FILE" 2>/dev/null || echo "PlutoVG: v${PLUTOVG_VERSION}" >> "$VERSION_FILE"
++        
++        echo -e "${GREEN}✓ plutovg built successfully (headers copied)${NC}"
++    ls -lh "$LIB_OUTPUT_DIR/libplutovg.a"
++    cd "$BUILD_DIR"
++fi
++echo ""
++fi
++
++# ==============================================================================
++# 4. Build LunaSVG (SVG parsing - depends on PlutoVG)
++# ==============================================================================
++if [ "$BUILD_LUNASVG" = true ]; then
++    CURRENT_LIB=$((CURRENT_LIB+1))
++    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building lunasvg v${LUNASVG_VERSION}... (BUILD FOURTH - SVG PARSING)${NC}"
++if [ -f "$LIB_OUTPUT_DIR/liblunasvg.a" ] && [ "$UPDATE_ALL" != true ]; then
++    echo -e "${YELLOW}✓ liblunasvg.a already exists, skipping build${NC}"
++    ls -lh "$LIB_OUTPUT_DIR/liblunasvg.a"
++        LIBS_SKIPPED+=("LunaSVG v${LUNASVG_VERSION}")
++    else
++        LIBS_BUILT+=("LunaSVG v${LUNASVG_VERSION}")
++        LUNASVG_DIR="lunasvg-${LUNASVG_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$LUNASVG_DIR"
++        fi
++        if [ ! -d "$LUNASVG_DIR" ]; then
++            echo -e "${YELLOW}Downloading lunasvg v${LUNASVG_VERSION}...${NC}"
++            $DOWNLOAD_CMD lunasvg.tar.gz "$LUNASVG_URL"
++            tar -xzf lunasvg.tar.gz
++            rm lunasvg.tar.gz
++        else
++            echo -e "${YELLOW}lunasvg v${LUNASVG_VERSION} source found, building...${NC}"
++        fi
++        cd "$LUNASVG_DIR"
++    rm -rf build
++    mkdir build && cd build
++    cmake .. -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DBUILD_SHARED_LIBS=OFF -DLUNASVG_BUILD_EXAMPLES=OFF
++    make -j$(nproc)
++    cp liblunasvg.a "$LIB_OUTPUT_DIR/"
++        
++        # Copy headers (check if already copied for this version)
++        if [ "$UPDATE_ALL" != true ] && grep -q "LunaSVG: v${LUNASVG_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/lunasvg" ] && [ "$(ls -A $HEADER_DIR/lunasvg 2>/dev/null)" ]; then
++            echo -e "${YELLOW}✓ LunaSVG v${LUNASVG_VERSION} headers already installed, skipping copy${NC}"
++            HEADERS_SKIPPED+=("LunaSVG v${LUNASVG_VERSION}")
++        else
++            echo -e "${YELLOW}Copying lunasvg v${LUNASVG_VERSION} headers...${NC}"
++            HEADERS_COPIED+=("LunaSVG v${LUNASVG_VERSION}")
++            cd ..
++            mkdir -p "$HEADER_DIR/lunasvg"
++            cp -r include/lunasvg.h "$HEADER_DIR/lunasvg/" 2>/dev/null || cp -r include/* "$HEADER_DIR/lunasvg/" 2>/dev/null || true
++            echo -e "${GREEN}✓ Headers copied${NC}"
++        fi
++        
++        # Track version
++        grep -q "LunaSVG: v${LUNASVG_VERSION}" "$VERSION_FILE" 2>/dev/null || echo "LunaSVG: v${LUNASVG_VERSION}" >> "$VERSION_FILE"
++        
++        echo -e "${GREEN}✓ lunasvg built successfully (headers copied)${NC}"
++    ls -lh "$LIB_OUTPUT_DIR/liblunasvg.a"
++    cd "$BUILD_DIR"
++fi
++echo ""
++fi
++
++# ==============================================================================
++# 5. Build Platform Backends (conditional based on --platform option)
+ # ==============================================================================
+ 
+ # ==============================================================================
+@@ -423,18 +624,21 @@ fi
+ # ==============================================================================
+ if [ "$BUILD_SDL3" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+-    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building SDL3 v${SDL3_VERSION} (BUILD SECOND - PLATFORM BACKEND)...${NC}"
++    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building SDL3 v${SDL3_VERSION} (BUILD FIFTH - PLATFORM BACKEND)...${NC}"
+     cd "$BUILD_DIR"
+-    if [ -f "$LIB_OUTPUT_DIR/libSDL3.a" ]; then
++    if [ -f "$LIB_OUTPUT_DIR/libSDL3.a" ] && [ "$UPDATE_ALL" != true ]; then
+         echo -e "${YELLOW}✓ libSDL3.a already exists, skipping build${NC}"
+         ls -lh "$LIB_OUTPUT_DIR/libSDL3.a"
+         LIBS_SKIPPED+=("SDL3 v${SDL3_VERSION}")
+     else
+         LIBS_BUILT+=("SDL3 v${SDL3_VERSION}")
+         SDL3_DIR="SDL-release-${SDL3_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$SDL3_DIR"
++        fi
+         if [ ! -d "$SDL3_DIR" ]; then
+             echo -e "${YELLOW}Downloading SDL3 v${SDL3_VERSION}...${NC}"
+-            $DOWNLOAD_CMD sdl3.tar.gz "https://github.com/libsdl-org/SDL/archive/refs/tags/release-${SDL3_VERSION}.tar.gz"
++            $DOWNLOAD_CMD sdl3.tar.gz "$SDL3_URL"
+             tar -xzf sdl3.tar.gz
+             rm sdl3.tar.gz
+         else
+@@ -444,7 +648,7 @@ if [ "$BUILD_SDL3" = true ]; then
+         rm -rf build
+         mkdir build && cd build
+         
+-        # Build with X11 and XRANDR support
++        # Build with X11 support (XTEST disabled - only needed for input automation)
+         if cmake .. \
+            -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+            -DBUILD_SHARED_LIBS=OFF \
+@@ -453,13 +657,15 @@ if [ "$BUILD_SDL3" = true ]; then
+            -DSDL_TEST=OFF \
+            -DSDL_X11=ON \
+            -DSDL_X11_XRANDR=ON \
++           -DSDL_X11_XSCRNSAVER=ON \
++           -DSDL_X11_XTEST=OFF \
+            -DSDL_WAYLAND=OFF \
+            -DSDL_OPENGL=ON && \
+            make -j$(nproc) && \
+            cp libSDL3.a "$LIB_OUTPUT_DIR/"; then
+             
+             # Copy headers (check if already copied for this version)
+-            if grep -q "SDL3: v${SDL3_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/SDL3" ] && [ "$(ls -A $HEADER_DIR/SDL3 2>/dev/null)" ]; then
++            if [ "$UPDATE_ALL" != true ] && grep -q "SDL3: v${SDL3_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/SDL3" ] && [ "$(ls -A $HEADER_DIR/SDL3 2>/dev/null)" ]; then
+                 echo -e "${YELLOW}✓ SDL3 v${SDL3_VERSION} headers already installed, skipping copy${NC}"
+                 HEADERS_SKIPPED+=("SDL3 v${SDL3_VERSION}")
+             else
+@@ -491,20 +697,23 @@ fi
+ # ==============================================================================
+ if [ "$BUILD_GLFW" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+-    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building GLFW v${GLFW_VERSION} (BUILD SECOND - PLATFORM BACKEND)...${NC}"
++    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building GLFW v${GLFW_VERSION} (BUILD FIFTH - PLATFORM BACKEND)...${NC}"
+     cd "$BUILD_DIR"
+-    if [ -f "$LIB_OUTPUT_DIR/libglfw3.a" ]; then
++    if [ -f "$LIB_OUTPUT_DIR/libglfw3.a" ] && [ "$UPDATE_ALL" != true ]; then
+         echo -e "${YELLOW}✓ libglfw3.a already exists, skipping build${NC}"
+         ls -lh "$LIB_OUTPUT_DIR/libglfw3.a"
+         LIBS_SKIPPED+=("GLFW v${GLFW_VERSION}")
+     else
+         LIBS_BUILT+=("GLFW v${GLFW_VERSION}")
+         GLFW_DIR="glfw-${GLFW_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$GLFW_DIR"
++        fi
+         if [ ! -d "$GLFW_DIR" ]; then
+             echo -e "${YELLOW}Downloading GLFW v${GLFW_VERSION}...${NC}"
+-            $DOWNLOAD_CMD glfw.zip "https://github.com/glfw/glfw/releases/download/${GLFW_VERSION}/glfw-${GLFW_VERSION}.zip"
+-            unzip -q glfw.zip
+-            rm glfw.zip
++            $DOWNLOAD_CMD glfw.tar.gz "$GLFW_URL"
++            tar -xzf glfw.tar.gz
++            rm glfw.tar.gz
+         else
+             echo -e "${YELLOW}GLFW v${GLFW_VERSION} source found, building...${NC}"
+         fi
+@@ -521,7 +730,7 @@ if [ "$BUILD_GLFW" = true ]; then
+         cp src/libglfw3.a "$LIB_OUTPUT_DIR/"
+         
+         # Copy headers (check if already copied for this version)
+-        if grep -q "GLFW: v${GLFW_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/GLFW" ] && [ "$(ls -A $HEADER_DIR/GLFW 2>/dev/null)" ]; then
++        if [ "$UPDATE_ALL" != true ] && grep -q "GLFW: v${GLFW_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/GLFW" ] && [ "$(ls -A $HEADER_DIR/GLFW 2>/dev/null)" ]; then
+             echo -e "${YELLOW}✓ GLFW v${GLFW_VERSION} headers already installed, skipping copy${NC}"
+             HEADERS_SKIPPED+=("GLFW v${GLFW_VERSION}")
+         else
+@@ -547,103 +756,175 @@ fi
+ # ==============================================================================
+ 
+ # ==============================================================================
+-# Build ImGui (immediate mode GUI - ALWAYS REQUIRED)
++# 6. Build ImGui (immediate mode GUI + FreeType - AFTER PLATFORM READY)
+ # ==============================================================================
+ if [ "$BUILD_IMGUI" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+-    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building ImGui...${NC}"
+-if [ -f "$LIB_OUTPUT_DIR/libimgui.a" ]; then
+-    echo -e "${YELLOW}✓ libimgui.a already exists, skipping build${NC}"
+-    ls -lh "$LIB_OUTPUT_DIR/libimgui.a"
+-        LIBS_SKIPPED+=("ImGui (bundled)")
++    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building ImGui v${IMGUI_VERSION}... (BUILD SIXTH - GUI + FREETYPE)${NC}"
++    cd "$BUILD_DIR"
++    
++    if [ -f "$LIB_OUTPUT_DIR/libimgui.a" ] && [ "$UPDATE_ALL" != true ]; then
++        echo -e "${YELLOW}✓ libimgui.a already exists, skipping build${NC}"
++        ls -lh "$LIB_OUTPUT_DIR/libimgui.a"
++        LIBS_SKIPPED+=("ImGui v${IMGUI_VERSION}")
+     else
+-        LIBS_BUILT+=("ImGui (bundled)")
++        LIBS_BUILT+=("ImGui v${IMGUI_VERSION}")
++        
++        IMGUI_DIR="imgui-${IMGUI_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$IMGUI_DIR"
++        fi
++        if [ ! -d "$IMGUI_DIR" ]; then
++            echo -e "${YELLOW}Downloading ImGui v${IMGUI_VERSION}...${NC}"
++            $DOWNLOAD_CMD imgui.tar.gz "$IMGUI_URL"
++            tar -xzf imgui.tar.gz
++            rm imgui.tar.gz
++        else
++            echo -e "${YELLOW}ImGui v${IMGUI_VERSION} source found, building...${NC}"
++        fi
++        
++        cd "$IMGUI_DIR"
++        
++        # Build ImGui with FreeType support
+         echo -e "${YELLOW}Building ImGui from source...${NC}"
+-    g++ -c -std=c++17 $CFLAGS \
+-        "$PROJECT_ROOT/src/libs/src/imgui.cpp" \
+-        "$PROJECT_ROOT/src/libs/src/imgui_draw.cpp" \
+-        "$PROJECT_ROOT/src/libs/src/imgui_tables.cpp" \
+-        "$PROJECT_ROOT/src/libs/src/imgui_widgets.cpp" \
+-        "$PROJECT_ROOT/src/libs/src/imgui_freetype.cpp" \
+-        -I"$PROJECT_ROOT/src/libs/inc/imgui" \
+-        -I"$PROJECT_ROOT/src/libs/inc/freetype2" \
+-        -DIMGUI_ENABLE_FREETYPE
+-    ar rcs libimgui.a imgui.o imgui_draw.o imgui_tables.o imgui_widgets.o imgui_freetype.o
+-    cp libimgui.a "$LIB_OUTPUT_DIR/"
+-    rm -f *.o
+-    echo -e "${GREEN}✓ ImGui built successfully${NC}"
+-    ls -lh "$LIB_OUTPUT_DIR/libimgui.a"
+-fi
+-echo ""
++        g++ -c -std=c++17 $CFLAGS \
++            -I. \
++            -I"$HEADER_DIR/freetype2" \
++            -DIMGUI_ENABLE_FREETYPE \
++            imgui.cpp \
++            imgui_demo.cpp \
++            imgui_draw.cpp \
++            imgui_tables.cpp \
++            imgui_widgets.cpp \
++            misc/freetype/imgui_freetype.cpp
++        
++        ar rcs libimgui.a imgui.o imgui_demo.o imgui_draw.o imgui_tables.o imgui_widgets.o imgui_freetype.o
++        cp libimgui.a "$LIB_OUTPUT_DIR/"
++        rm -f *.o
++        
++        # Copy headers (and required backend sources)
++        if [ "$UPDATE_ALL" != true ] && grep -q "ImGui: v${IMGUI_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/imgui" ] && [ "$(ls -A $HEADER_DIR/imgui 2>/dev/null)" ]; then
++            echo -e "${YELLOW}✓ ImGui v${IMGUI_VERSION} headers already installed, skipping copy${NC}"
++            HEADERS_SKIPPED+=("ImGui v${IMGUI_VERSION}")
++        else
++            echo -e "${YELLOW}Copying ImGui v${IMGUI_VERSION} headers...${NC}"
++            HEADERS_COPIED+=("ImGui v${IMGUI_VERSION}")
++            mkdir -p "$HEADER_DIR/imgui"
++            cp *.h "$HEADER_DIR/imgui/" 2>/dev/null || true
++            mkdir -p "$HEADER_DIR/imgui/backends"
++            case "$PLATFORM" in
++                sdl3)
++                    cp backends/imgui_impl_sdl3.h "$HEADER_DIR/imgui/backends/" 2>/dev/null || true
++                    cp backends/imgui_impl_sdl3.cpp "$HEADER_DIR/imgui/backends/" 2>/dev/null || true
++                    ;;
++                glfw)
++                    cp backends/imgui_impl_glfw.h "$HEADER_DIR/imgui/backends/" 2>/dev/null || true
++                    cp backends/imgui_impl_glfw.cpp "$HEADER_DIR/imgui/backends/" 2>/dev/null || true
++                    ;;
++            esac
++            if [ "$PLATFORM" = "sdl3" ] || [ "$PLATFORM" = "glfw" ]; then
++                cp backends/imgui_impl_opengl3.h "$HEADER_DIR/imgui/backends/" 2>/dev/null || true
++                cp backends/imgui_impl_opengl3.cpp "$HEADER_DIR/imgui/backends/" 2>/dev/null || true
++            fi
++            cp -r misc "$HEADER_DIR/imgui/" 2>/dev/null || true
++            echo -e "${GREEN}✓ Headers copied${NC}"
++        fi
++        
++        # Track version
++        grep -q "ImGui: v${IMGUI_VERSION}" "$VERSION_FILE" 2>/dev/null || echo "ImGui: v${IMGUI_VERSION}" >> "$VERSION_FILE"
++        
++        echo -e "${GREEN}✓ ImGui built successfully (with FreeType)${NC}"
++        ls -lh "$LIB_OUTPUT_DIR/libimgui.a"
++        cd "$BUILD_DIR"
++    fi
++    echo ""
+ fi
+ 
+ # ==============================================================================
+-# Build ImPlot (plotting library for ImGui)
++# 7. Build ImPlot (plotting library - AFTER IMGUI)
+ # ==============================================================================
+ if [ "$BUILD_IMPLOT" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+-    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building ImPlot...${NC}"
+-if [ -f "$LIB_OUTPUT_DIR/libimplot.a" ]; then
+-    echo -e "${YELLOW}✓ libimplot.a already exists, skipping build${NC}"
+-    ls -lh "$LIB_OUTPUT_DIR/libimplot.a"
+-        LIBS_SKIPPED+=("ImPlot (bundled)")
++    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building ImPlot v${IMPLOT_VERSION}... (BUILD SEVENTH - PLOTTING)${NC}"
++    cd "$BUILD_DIR"
++    
++    if [ -f "$LIB_OUTPUT_DIR/libimplot.a" ] && [ "$UPDATE_ALL" != true ]; then
++        echo -e "${YELLOW}✓ libimplot.a already exists, skipping build${NC}"
++        ls -lh "$LIB_OUTPUT_DIR/libimplot.a"
++        LIBS_SKIPPED+=("ImPlot v${IMPLOT_VERSION}")
+     else
+-        LIBS_BUILT+=("ImPlot (bundled)")
++        LIBS_BUILT+=("ImPlot v${IMPLOT_VERSION}")
++        
++        IMPLOT_DIR="implot-${IMPLOT_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$IMPLOT_DIR"
++        fi
++        if [ ! -d "$IMPLOT_DIR" ]; then
++            echo -e "${YELLOW}Downloading ImPlot v${IMPLOT_VERSION}...${NC}"
++            $DOWNLOAD_CMD implot.tar.gz "$IMPLOT_URL"
++            tar -xzf implot.tar.gz
++            rm implot.tar.gz
++        else
++            echo -e "${YELLOW}ImPlot v${IMPLOT_VERSION} source found, building...${NC}"
++        fi
++        
++        cd "$IMPLOT_DIR"
++        
++        # Build ImPlot
+         echo -e "${YELLOW}Building ImPlot from source...${NC}"
+-    g++ -c -std=c++17 $CFLAGS \
+-        "$PROJECT_ROOT/src/libs/src/implot.cpp" \
+-        "$PROJECT_ROOT/src/libs/src/implot_items.cpp" \
+-        -I"$PROJECT_ROOT/src/libs/inc/imgui" \
+-        -I"$PROJECT_ROOT/src/libs/inc/implot"
+-    ar rcs libimplot.a implot.o implot_items.o
+-    cp libimplot.a "$LIB_OUTPUT_DIR/"
+-    rm -f *.o
+-    echo -e "${GREEN}✓ ImPlot built successfully${NC}"
+-    ls -lh "$LIB_OUTPUT_DIR/libimplot.a"
+-fi
+-echo ""
+-fi
+-
+-# ==============================================================================
+-# Build Yoga (flexbox layout engine - ALWAYS REQUIRED)
+-# ==============================================================================
+-if [ "$BUILD_YOGA" = true ]; then
+-    CURRENT_LIB=$((CURRENT_LIB+1))
+-    echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building Yoga...${NC}"
+-if [ -f "$LIB_OUTPUT_DIR/libyogacore.a" ]; then
+-    echo -e "${YELLOW}✓ libyogacore.a already exists, skipping build${NC}"
+-    ls -lh "$LIB_OUTPUT_DIR/libyogacore.a"
+-        LIBS_SKIPPED+=("Yoga (bundled)")
+-    else
+-        LIBS_BUILT+=("Yoga (bundled)")
+-        echo -e "${YELLOW}Building Yoga from source...${NC}"
+-    find "$PROJECT_ROOT/src/libs/src/yoga" -name "*.cpp" -exec g++ -c -std=c++20 $CFLAGS {} \
+-        -I"$PROJECT_ROOT/src/libs/inc/yoga" \;
+-    ar rcs libyogacore.a *.o
+-    cp libyogacore.a "$LIB_OUTPUT_DIR/"
+-    rm -f *.o
+-    echo -e "${GREEN}✓ Yoga built successfully${NC}"
+-    ls -lh "$LIB_OUTPUT_DIR/libyogacore.a"
+-fi
+-echo ""
++        g++ -c -std=c++17 $CFLAGS \
++            -I. \
++            -I"$HEADER_DIR/imgui" \
++            implot.cpp \
++            implot_items.cpp \
++            implot_demo.cpp
++        
++        ar rcs libimplot.a implot.o implot_items.o implot_demo.o
++        cp libimplot.a "$LIB_OUTPUT_DIR/"
++        rm -f *.o
++        
++        # Copy headers
++        if [ "$UPDATE_ALL" != true ] && grep -q "ImPlot: v${IMPLOT_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/implot" ] && [ "$(ls -A $HEADER_DIR/implot 2>/dev/null)" ]; then
++            echo -e "${YELLOW}✓ ImPlot v${IMPLOT_VERSION} headers already installed, skipping copy${NC}"
++            HEADERS_SKIPPED+=("ImPlot v${IMPLOT_VERSION}")
++        else
++            echo -e "${YELLOW}Copying ImPlot v${IMPLOT_VERSION} headers...${NC}"
++            HEADERS_COPIED+=("ImPlot v${IMPLOT_VERSION}")
++            mkdir -p "$HEADER_DIR/implot"
++            cp *.h "$HEADER_DIR/implot/" 2>/dev/null || true
++            echo -e "${GREEN}✓ Headers copied${NC}"
++        fi
++        
++        # Track version
++        grep -q "ImPlot: v${IMPLOT_VERSION}" "$VERSION_FILE" 2>/dev/null || echo "ImPlot: v${IMPLOT_VERSION}" >> "$VERSION_FILE"
++        
++        echo -e "${GREEN}✓ ImPlot built successfully${NC}"
++        ls -lh "$LIB_OUTPUT_DIR/libimplot.a"
++        cd "$BUILD_DIR"
++    fi
++    echo ""
+ fi
+ 
++if false; then  # DISABLED - duplicate of earlier PlutoVG build
+ # ==============================================================================
+-# Build PlutoVG (SVG vector rendering)
++# Build PlutoVG (SVG vector rendering) - ALREADY BUILT EARLIER, SKIP DUPLICATE
+ # ==============================================================================
+ if [ "$BUILD_PLUTOVG" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building plutovg v${PLUTOVG_VERSION}...${NC}"
+-if [ -f "$LIB_OUTPUT_DIR/libplutovg.a" ]; then
++if [ -f "$LIB_OUTPUT_DIR/libplutovg.a" ] && [ "$UPDATE_ALL" != true ]; then
+     echo -e "${YELLOW}✓ libplutovg.a already exists, skipping build${NC}"
+     ls -lh "$LIB_OUTPUT_DIR/libplutovg.a"
+         LIBS_SKIPPED+=("PlutoVG v${PLUTOVG_VERSION}")
+     else
+         LIBS_BUILT+=("PlutoVG v${PLUTOVG_VERSION}")
+         PLUTOVG_DIR="plutovg-${PLUTOVG_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$PLUTOVG_DIR"
++        fi
+         if [ ! -d "$PLUTOVG_DIR" ]; then
+             echo -e "${YELLOW}Downloading plutovg v${PLUTOVG_VERSION}...${NC}"
+-            $DOWNLOAD_CMD plutovg.tar.gz "https://github.com/sammycage/plutovg/archive/refs/tags/v${PLUTOVG_VERSION}.tar.gz"
++            $DOWNLOAD_CMD plutovg.tar.gz "$PLUTOVG_URL"
+             tar -xzf plutovg.tar.gz
+             rm plutovg.tar.gz
+         else
+@@ -657,7 +938,7 @@ if [ -f "$LIB_OUTPUT_DIR/libplutovg.a" ]; then
+     cp libplutovg.a "$LIB_OUTPUT_DIR/"
+         
+         # Copy headers (check if already copied for this version)
+-        if grep -q "PlutoVG: v${PLUTOVG_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/plutovg" ] && [ "$(ls -A $HEADER_DIR/plutovg 2>/dev/null)" ]; then
++        if [ "$UPDATE_ALL" != true ] && grep -q "PlutoVG: v${PLUTOVG_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/plutovg" ] && [ "$(ls -A $HEADER_DIR/plutovg 2>/dev/null)" ]; then
+             echo -e "${YELLOW}✓ PlutoVG v${PLUTOVG_VERSION} headers already installed, skipping copy${NC}"
+             HEADERS_SKIPPED+=("PlutoVG v${PLUTOVG_VERSION}")
+         else
+@@ -676,9 +957,11 @@ if [ -f "$LIB_OUTPUT_DIR/libplutovg.a" ]; then
+     ls -lh "$LIB_OUTPUT_DIR/libplutovg.a"
+     cd "$BUILD_DIR"
+ fi
++fi
+ echo ""
+ fi
+ 
++if false; then  # DISABLED - duplicate of earlier LunaSVG build
+ # ==============================================================================
+ # Build LunaSVG (SVG parsing)
+ # ==============================================================================
+@@ -686,16 +969,19 @@ if [ "$BUILD_LUNASVG" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building lunasvg v${LUNASVG_VERSION}...${NC}"
+ cd "$BUILD_DIR"
+-if [ -f "$LIB_OUTPUT_DIR/liblunasvg.a" ]; then
++if [ -f "$LIB_OUTPUT_DIR/liblunasvg.a" ] && [ "$UPDATE_ALL" != true ]; then
+     echo -e "${YELLOW}✓ liblunasvg.a already exists, skipping build${NC}"
+     ls -lh "$LIB_OUTPUT_DIR/liblunasvg.a"
+         LIBS_SKIPPED+=("LunaSVG v${LUNASVG_VERSION}")
+     else
+         LIBS_BUILT+=("LunaSVG v${LUNASVG_VERSION}")
+         LUNASVG_DIR="lunasvg-${LUNASVG_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$LUNASVG_DIR"
++        fi
+         if [ ! -d "$LUNASVG_DIR" ]; then
+             echo -e "${YELLOW}Downloading lunasvg v${LUNASVG_VERSION}...${NC}"
+-            $DOWNLOAD_CMD lunasvg.tar.gz "https://github.com/sammycage/lunasvg/archive/refs/tags/v${LUNASVG_VERSION}.tar.gz"
++            $DOWNLOAD_CMD lunasvg.tar.gz "$LUNASVG_URL"
+             tar -xzf lunasvg.tar.gz
+             rm lunasvg.tar.gz
+         else
+@@ -709,7 +995,7 @@ if [ -f "$LIB_OUTPUT_DIR/liblunasvg.a" ]; then
+     cp liblunasvg.a "$LIB_OUTPUT_DIR/"
+         
+         # Copy headers (check if already copied for this version)
+-        if grep -q "LunaSVG: v${LUNASVG_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/lunasvg" ] && [ "$(ls -A $HEADER_DIR/lunasvg 2>/dev/null)" ]; then
++        if [ "$UPDATE_ALL" != true ] && grep -q "LunaSVG: v${LUNASVG_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/lunasvg" ] && [ "$(ls -A $HEADER_DIR/lunasvg 2>/dev/null)" ]; then
+             echo -e "${YELLOW}✓ LunaSVG v${LUNASVG_VERSION} headers already installed, skipping copy${NC}"
+             HEADERS_SKIPPED+=("LunaSVG v${LUNASVG_VERSION}")
+         else
+@@ -728,23 +1014,28 @@ if [ -f "$LIB_OUTPUT_DIR/liblunasvg.a" ]; then
+     ls -lh "$LIB_OUTPUT_DIR/liblunasvg.a"
+     cd "$BUILD_DIR"
+ fi
++fi
+ echo ""
+ fi
+ 
++if false; then  # DISABLED - duplicate of earlier SDL3 build
+ if [ "$BUILD_SDL3" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building SDL3 v${SDL3_VERSION} (this may take a while)...${NC}"
+ cd "$BUILD_DIR"
+-if [ -f "$LIB_OUTPUT_DIR/libSDL3.a" ]; then
++if [ -f "$LIB_OUTPUT_DIR/libSDL3.a" ] && [ "$UPDATE_ALL" != true ]; then
+     echo -e "${YELLOW}✓ libSDL3.a already exists, skipping build${NC}"
+     ls -lh "$LIB_OUTPUT_DIR/libSDL3.a"
+         LIBS_SKIPPED+=("SDL3 v${SDL3_VERSION}")
+     else
+         LIBS_BUILT+=("SDL3 v${SDL3_VERSION}")
+         SDL3_DIR="SDL-release-${SDL3_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$SDL3_DIR"
++        fi
+         if [ ! -d "$SDL3_DIR" ]; then
+             echo -e "${YELLOW}Downloading SDL3 v${SDL3_VERSION}...${NC}"
+-            $DOWNLOAD_CMD SDL3.tar.gz "https://github.com/libsdl-org/SDL/archive/refs/tags/release-${SDL3_VERSION}.tar.gz"
++            $DOWNLOAD_CMD SDL3.tar.gz "$SDL3_URL"
+             tar -xzf SDL3.tar.gz
+             rm SDL3.tar.gz
+         else
+@@ -770,7 +1061,7 @@ if [ -f "$LIB_OUTPUT_DIR/libSDL3.a" ]; then
+        cp libSDL3.a "$LIB_OUTPUT_DIR/"; then
+             
+             # Copy headers (check if already copied for this version)
+-            if grep -q "SDL3: v${SDL3_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/SDL3" ] && [ "$(ls -A $HEADER_DIR/SDL3 2>/dev/null)" ]; then
++            if [ "$UPDATE_ALL" != true ] && grep -q "SDL3: v${SDL3_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/SDL3" ] && [ "$(ls -A $HEADER_DIR/SDL3 2>/dev/null)" ]; then
+                 echo -e "${YELLOW}✓ SDL3 v${SDL3_VERSION} headers already installed, skipping copy${NC}"
+                 HEADERS_SKIPPED+=("SDL3 v${SDL3_VERSION}")
+             else
+@@ -797,7 +1088,9 @@ if [ -f "$LIB_OUTPUT_DIR/libSDL3.a" ]; then
+     fi
+     echo ""
+ fi
++fi
+ 
++if false; then  # DISABLED - duplicate of earlier GLFW build
+ # ==============================================================================
+ # Build GLFW3 (windowing library)
+ # ==============================================================================
+@@ -805,16 +1098,19 @@ if [ "$BUILD_GLFW" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building GLFW v${GLFW_VERSION}...${NC}"
+     cd "$BUILD_DIR"
+-    if [ -f "$LIB_OUTPUT_DIR/libglfw3.a" ]; then
++if [ -f "$LIB_OUTPUT_DIR/libglfw3.a" ] && [ "$UPDATE_ALL" != true ]; then
+         echo -e "${YELLOW}✓ libglfw3.a already exists, skipping build${NC}"
+         ls -lh "$LIB_OUTPUT_DIR/libglfw3.a"
+         LIBS_SKIPPED+=("GLFW v${GLFW_VERSION}")
+     else
+         LIBS_BUILT+=("GLFW v${GLFW_VERSION}")
+         GLFW_DIR="glfw-${GLFW_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$GLFW_DIR"
++        fi
+         if [ ! -d "$GLFW_DIR" ]; then
+             echo -e "${YELLOW}Downloading GLFW v${GLFW_VERSION}...${NC}"
+-            $DOWNLOAD_CMD glfw.tar.gz "https://github.com/glfw/glfw/archive/refs/tags/${GLFW_VERSION}.tar.gz"
++            $DOWNLOAD_CMD glfw.tar.gz "$GLFW_URL"
+             tar -xzf glfw.tar.gz
+             rm glfw.tar.gz
+         else
+@@ -834,7 +1130,7 @@ if [ "$BUILD_GLFW" = true ]; then
+         cp src/libglfw3.a "$LIB_OUTPUT_DIR/"
+         
+         # Copy headers (check if already copied for this version)
+-        if grep -q "GLFW: v${GLFW_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/GLFW" ] && [ "$(ls -A $HEADER_DIR/GLFW 2>/dev/null)" ]; then
++        if [ "$UPDATE_ALL" != true ] && grep -q "GLFW: v${GLFW_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/GLFW" ] && [ "$(ls -A $HEADER_DIR/GLFW 2>/dev/null)" ]; then
+             echo -e "${YELLOW}✓ GLFW v${GLFW_VERSION} headers already installed, skipping copy${NC}"
+             HEADERS_SKIPPED+=("GLFW v${GLFW_VERSION}")
+         else
+@@ -855,11 +1151,12 @@ if [ "$BUILD_GLFW" = true ]; then
+     fi
+ echo ""
+ fi
++fi
+ 
+ # ==============================================================================
+-# Build FreeType (font rendering - ALWAYS REQUIRED)
++# DUPLICATE SECTION DISABLED - FreeType now built earlier (BUILD FIRST)
+ # ==============================================================================
+-if [ "$BUILD_FREETYPE" = true ]; then
++if false; then  # DISABLED - duplicate of earlier FreeType build
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building freetype v${FREETYPE_VERSION}...${NC}"
+ cd "$BUILD_DIR"
+@@ -869,10 +1166,10 @@ if [ -f "$LIB_OUTPUT_DIR/libfreetype.a" ]; then
+         LIBS_SKIPPED+=("FreeType v${FREETYPE_VERSION}")
+     else
+         LIBS_BUILT+=("FreeType v${FREETYPE_VERSION}")
+-        FREETYPE_DIR="freetype-${FREETYPE_VERSION}"
++        FREETYPE_DIR="freetype-VER-${FREETYPE_VERSION//./-}"
+         if [ ! -d "$FREETYPE_DIR" ]; then
+             echo -e "${YELLOW}Downloading freetype v${FREETYPE_VERSION}...${NC}"
+-            $DOWNLOAD_CMD freetype.tar.gz "https://download.savannah.gnu.org/releases/freetype/freetype-${FREETYPE_VERSION}.tar.gz"
++            $DOWNLOAD_CMD freetype.tar.gz "$FREETYPE_URL"
+             tar -xzf freetype.tar.gz
+             rm freetype.tar.gz
+         else
+@@ -921,9 +1218,9 @@ echo ""
+ fi
+ 
+ # ==============================================================================
+-# Build ImGui (immediate mode GUI - ALWAYS REQUIRED)
++# DUPLICATE SECTION DISABLED - ImGui now built earlier from downloaded tarball
+ # ==============================================================================
+-if [ "$BUILD_IMGUI" = true ]; then
++if false; then  # DISABLED - duplicate of earlier ImGui build
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building ImGui...${NC}"
+ if [ -f "$LIB_OUTPUT_DIR/libimgui.a" ]; then
+@@ -963,9 +1260,9 @@ echo ""
+ fi
+ 
+ # ==============================================================================
+-# Build ImPlot (plotting library)
++# DUPLICATE SECTION DISABLED - ImPlot now built earlier from downloaded tarball
+ # ==============================================================================
+-if [ "$BUILD_IMPLOT" = true ]; then
++if false; then  # DISABLED - duplicate of earlier ImPlot build
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building ImPlot...${NC}"
+ if [ -f "$LIB_OUTPUT_DIR/libimplot.a" ]; then
+@@ -996,9 +1293,9 @@ echo ""
+ fi
+ 
+ # ==============================================================================
+-# Build Yoga (flexbox layout - ALWAYS REQUIRED)
++# DUPLICATE SECTION DISABLED - Yoga now built earlier from downloaded tarball
+ # ==============================================================================
+-if [ "$BUILD_YOGA" = true ]; then
++if false; then  # DISABLED - duplicate of earlier Yoga build
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building Yoga...${NC}"
+ if [ -f "$LIB_OUTPUT_DIR/libyogacore.a" ]; then
+@@ -1036,36 +1333,33 @@ if [ "$BUILD_BLEND2D" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building blend2d v${BLEND2D_VERSION} (this may take a while)...${NC}"
+ cd "$BUILD_DIR"
+-if [ -f "$LIB_OUTPUT_DIR/libblend2d.a" ]; then
++if [ -f "$LIB_OUTPUT_DIR/libblend2d.a" ] && [ "$UPDATE_ALL" != true ]; then
+     echo -e "${YELLOW}✓ libblend2d.a already exists, skipping build${NC}"
+     ls -lh "$LIB_OUTPUT_DIR/libblend2d.a"
+         LIBS_SKIPPED+=("Blend2D v${BLEND2D_VERSION}")
+     else
+         LIBS_BUILT+=("Blend2D v${BLEND2D_VERSION}")
+         BLEND2D_DIR="blend2d-${BLEND2D_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$BLEND2D_DIR"
++        fi
+         if [ ! -d "$BLEND2D_DIR" ]; then
+             echo -e "${YELLOW}Downloading blend2d v${BLEND2D_VERSION}...${NC}"
+-            $DOWNLOAD_CMD blend2d.tar.gz "https://github.com/blend2d/blend2d/archive/refs/tags/${BLEND2D_VERSION}.tar.gz"
++            $DOWNLOAD_CMD blend2d.tar.gz "$BLEND2D_URL"
++            # Blend2D tarball extracts flat, so extract then rename
+             tar -xzf blend2d.tar.gz
++            # The tarball may extract to 'blend2d' or current directory
++            if [ -d "blend2d" ]; then
++                mv blend2d "$BLEND2D_DIR"
++            fi
+             rm blend2d.tar.gz
+         else
+             echo -e "${YELLOW}blend2d v${BLEND2D_VERSION} source found${NC}"
+         fi
+         
+-        # Download AsmJit dependency
++        # Build Blend2D (CMake will fetch AsmJit automatically)
+         cd "$BLEND2D_DIR"
+-    if [ ! -d "3rdparty/asmjit" ]; then
+-            echo -e "${YELLOW}Downloading asmjit ${ASMJIT_VERSION}...${NC}"
+-        mkdir -p 3rdparty
+-        cd 3rdparty
+-            $DOWNLOAD_CMD asmjit.tar.gz "https://github.com/asmjit/asmjit/archive/refs/tags/${ASMJIT_VERSION}.tar.gz"
+-            tar -xzf asmjit.tar.gz
+-            mv "asmjit-${ASMJIT_VERSION}" asmjit
+-            rm asmjit.tar.gz
+-        cd ..
+-    fi
+-
+-    rm -rf build
++        rm -rf build
+     mkdir build && cd build
+         echo -e "${YELLOW}Building blend2d...${NC}"
+     cmake .. \
+@@ -1083,7 +1377,7 @@ if [ -f "$LIB_OUTPUT_DIR/libblend2d.a" ]; then
+     cp libblend2d.a "$LIB_OUTPUT_DIR/"
+         
+         # Copy headers (check if already copied for this version)
+-        if grep -q "Blend2D: v${BLEND2D_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/blend2d" ] && [ "$(ls -A $HEADER_DIR/blend2d 2>/dev/null)" ]; then
++        if [ "$UPDATE_ALL" != true ] && grep -q "Blend2D: v${BLEND2D_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/blend2d" ] && [ "$(ls -A $HEADER_DIR/blend2d 2>/dev/null)" ]; then
+             echo -e "${YELLOW}✓ Blend2D v${BLEND2D_VERSION} headers already installed, skipping copy${NC}"
+             HEADERS_SKIPPED+=("Blend2D v${BLEND2D_VERSION}")
+         else
+@@ -1114,16 +1408,19 @@ if [ "$BUILD_NFDEXT" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building nfd-extended ${NFD_VERSION}...${NC}"
+     cd "$BUILD_DIR"
+-    if [ -f "$LIB_OUTPUT_DIR/libnfd.a" ]; then
++    if [ -f "$LIB_OUTPUT_DIR/libnfd.a" ] && [ "$UPDATE_ALL" != true ]; then
+         echo -e "${YELLOW}✓ libnfd.a already exists, skipping build${NC}"
+         ls -lh "$LIB_OUTPUT_DIR/libnfd.a"
+         LIBS_SKIPPED+=("NFD-extended ${NFD_VERSION}")
+     else
+         LIBS_BUILT+=("NFD-extended ${NFD_VERSION}")
+         NFD_DIR="nativefiledialog-extended-${NFD_VERSION#v}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$NFD_DIR"
++        fi
+         if [ ! -d "$NFD_DIR" ]; then
+             echo -e "${YELLOW}Downloading nfd-extended ${NFD_VERSION}...${NC}"
+-            $DOWNLOAD_CMD nfd.tar.gz "https://github.com/btzy/nativefiledialog-extended/archive/refs/tags/${NFD_VERSION}.tar.gz"
++            $DOWNLOAD_CMD nfd.tar.gz "$NFD_URL"
+             tar -xzf nfd.tar.gz
+             rm nfd.tar.gz
+         else
+@@ -1140,7 +1437,7 @@ if [ "$BUILD_NFDEXT" = true ]; then
+         cp src/libnfd.a "$LIB_OUTPUT_DIR/"
+         
+         # Copy headers (check if already copied for this version)
+-        if grep -q "NFD-extended: ${NFD_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/nfd-ext" ] && [ "$(ls -A $HEADER_DIR/nfd-ext 2>/dev/null)" ]; then
++        if [ "$UPDATE_ALL" != true ] && grep -q "NFD-extended: ${NFD_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -d "$HEADER_DIR/nfd-ext" ] && [ "$(ls -A $HEADER_DIR/nfd-ext 2>/dev/null)" ]; then
+             echo -e "${YELLOW}✓ NFD-extended ${NFD_VERSION} headers already installed, skipping copy${NC}"
+             HEADERS_SKIPPED+=("NFD-extended ${NFD_VERSION}")
+         else
+@@ -1169,16 +1466,19 @@ if [ "$BUILD_PDCURSES" = true ]; then
+     CURRENT_LIB=$((CURRENT_LIB+1))
+     echo -e "${GREEN}[$CURRENT_LIB/$LIB_COUNT] Building PDCurses v${PDCURSES_VERSION}...${NC}"
+     cd "$BUILD_DIR"
+-    if [ -f "$LIB_OUTPUT_DIR/libpdcurses.a" ]; then
++    if [ -f "$LIB_OUTPUT_DIR/libpdcurses.a" ] && [ "$UPDATE_ALL" != true ]; then
+         echo -e "${YELLOW}✓ libpdcurses.a already exists, skipping build${NC}"
+         ls -lh "$LIB_OUTPUT_DIR/libpdcurses.a"
+         LIBS_SKIPPED+=("PDCurses v${PDCURSES_VERSION}")
+     else
+         LIBS_BUILT+=("PDCurses v${PDCURSES_VERSION}")
+         PDCURSES_DIR="PDCurses-${PDCURSES_VERSION}"
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "$PDCURSES_DIR"
++        fi
+         if [ ! -d "$PDCURSES_DIR" ]; then
+             echo -e "${YELLOW}Downloading PDCurses v${PDCURSES_VERSION}...${NC}"
+-            $DOWNLOAD_CMD pdcurses.tar.gz "https://github.com/wmcbrine/PDCurses/archive/refs/tags/${PDCURSES_VERSION}.tar.gz"
++            $DOWNLOAD_CMD pdcurses.tar.gz "$PDCURSES_URL"
+             tar -xzf pdcurses.tar.gz
+             rm pdcurses.tar.gz
+         else
+@@ -1193,7 +1493,7 @@ if [ "$BUILD_PDCURSES" = true ]; then
+         cp libXCurses.a "$LIB_OUTPUT_DIR/libpdcurses.a"
+         
+         # Copy headers (check if already copied for this version)
+-        if grep -q "PDCurses: v${PDCURSES_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -f "$HEADER_DIR/pdcurses/curses.h" ]; then
++        if [ "$UPDATE_ALL" != true ] && grep -q "PDCurses: v${PDCURSES_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -f "$HEADER_DIR/pdcurses/curses.h" ]; then
+             echo -e "${YELLOW}✓ PDCurses v${PDCURSES_VERSION} headers already installed, skipping copy${NC}"
+             HEADERS_SKIPPED+=("PDCurses v${PDCURSES_VERSION}")
+         else
+@@ -1224,15 +1524,20 @@ if [ "$BUILD_JSON" = true ]; then
+     cd "$BUILD_DIR"
+     
+     JSON_HEADER_DIR="$PROJECT_ROOT/src/libs/inc/nlohmann"
+-    if grep -q "nlohmann-json: v${JSON_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -f "$JSON_HEADER_DIR/json.hpp" ]; then
++    if [ "$UPDATE_ALL" != true ] && grep -q "nlohmann-json: v${JSON_VERSION}" "$VERSION_FILE" 2>/dev/null && [ -f "$JSON_HEADER_DIR/json.hpp" ]; then
+         echo -e "${YELLOW}✓ nlohmann-json v${JSON_VERSION} already installed, skipping download${NC}"
+         HEADERS_SKIPPED+=("nlohmann-json v${JSON_VERSION} (header-only)")
+     else
+         echo -e "${YELLOW}Downloading nlohmann-json v${JSON_VERSION}...${NC}"
+         HEADERS_COPIED+=("nlohmann-json v${JSON_VERSION} (header-only)")
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "json-${JSON_VERSION}" json.tar.gz
++        fi
++        $DOWNLOAD_CMD json.tar.gz "$JSON_URL"
++        tar -xzf json.tar.gz
+         mkdir -p "$JSON_HEADER_DIR"
+-        $DOWNLOAD_CMD "$JSON_HEADER_DIR/json.hpp" "https://github.com/nlohmann/json/releases/download/v${JSON_VERSION}/json.hpp"
+-        echo -e "${GREEN}✓ nlohmann-json header downloaded${NC}"
++        cp json-${JSON_VERSION}/single_include/nlohmann/json.hpp "$JSON_HEADER_DIR/"
++        echo -e "${GREEN}✓ nlohmann-json header extracted and copied${NC}"
+     fi
+     
+     # Track version
+@@ -1250,7 +1555,7 @@ if [ "$COPY_STB_IMAGE" = true ]; then
+     STB_HEADER_DIR="$PROJECT_ROOT/src/libs/inc/stb_image"
+     
+     # Check if already installed (stb_image doesn't have release versions, so just check if exists)
+-    if [ -f "$STB_HEADER_DIR/stb_image.h" ] && grep -q "stb_image:" "$VERSION_FILE" 2>/dev/null; then
++    if [ "$UPDATE_ALL" != true ] && [ -f "$STB_HEADER_DIR/stb_image.h" ] && grep -q "stb_image:" "$VERSION_FILE" 2>/dev/null; then
+         STB_VERSION=$(grep "stb_image.*v" "$STB_HEADER_DIR/stb_image.h" | head -1 | grep -oP 'v[\d.]+' || echo "latest")
+         echo -e "${YELLOW}✓ stb_image ${STB_VERSION} already installed, skipping download${NC}"
+         HEADERS_SKIPPED+=("stb_image (header-only)")
+@@ -1258,7 +1563,7 @@ if [ "$COPY_STB_IMAGE" = true ]; then
+         HEADERS_COPIED+=("stb_image (header-only)")
+         mkdir -p "$STB_HEADER_DIR"
+         echo -e "${YELLOW}Downloading stb_image.h (latest)...${NC}"
+-        $DOWNLOAD_CMD "$STB_HEADER_DIR/stb_image.h" "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h"
++        $DOWNLOAD_CMD "$STB_HEADER_DIR/stb_image.h" "$STB_IMAGE_URL"
+         echo -e "${GREEN}✓ stb_image.h downloaded${NC}"
+     fi
+     
+@@ -1278,7 +1583,7 @@ if [ "$COPY_FONTAWESOME" = true ]; then
+     ICON_HEADER_DIR="$PROJECT_ROOT/src/libs/inc/iconfonts"
+     
+     # Check if already installed (FontAwesome doesn't have release versions, so just check if exists)
+-    if [ -f "$ICON_HEADER_DIR/IconsFontAwesome6.h" ] && grep -q "IconFontCppHeaders:" "$VERSION_FILE" 2>/dev/null; then
++    if [ "$UPDATE_ALL" != true ] && [ -f "$ICON_HEADER_DIR/IconsFontAwesome6.h" ] && grep -q "IconFontCppHeaders:" "$VERSION_FILE" 2>/dev/null; then
+         FA_VERSION=$(grep "Font Awesome" "$ICON_HEADER_DIR/IconsFontAwesome6.h" | grep -oP '[\d.]+' | head -1 || echo "6.x")
+         echo -e "${YELLOW}✓ IconFontCppHeaders (FontAwesome ${FA_VERSION}) already installed, skipping download${NC}"
+         HEADERS_SKIPPED+=("IconFontCppHeaders (header-only)")
+@@ -1288,9 +1593,12 @@ if [ "$COPY_FONTAWESOME" = true ]; then
+         cd "$BUILD_DIR"
+         
+         # Download IconFontCppHeaders (no releases, use specific commit or latest)
++        if [ "$UPDATE_ALL" = true ]; then
++            rm -rf "IconFontCppHeaders" "IconFontCppHeaders-main" "IconFontCppHeaders.zip"
++        fi
+         if [ ! -d "IconFontCppHeaders" ]; then
+             echo -e "${YELLOW}Downloading IconFontCppHeaders (latest)...${NC}"
+-            $DOWNLOAD_CMD IconFontCppHeaders.zip "https://github.com/juliettef/IconFontCppHeaders/archive/refs/heads/main.zip"
++            $DOWNLOAD_CMD IconFontCppHeaders.zip "$ICONFONT_URL"
+             unzip -q IconFontCppHeaders.zip
+             mv IconFontCppHeaders-main IconFontCppHeaders
+             rm IconFontCppHeaders.zip
+diff --git a/glimmer.h b/glimmer.h
+index adc0b76..0108235 100644
+--- a/glimmer.h
++++ b/glimmer.h
+@@ -1 +1,7 @@
++#pragma once
++
++// Include platform configuration (defines GLIMMER_PLATFORM_* and feature flags)
++#include "src/platform_config.h"
++
++// Main Glimmer API
+ #include "src/widgets.h"
+\ No newline at end of file
+diff --git a/src/config.h b/src/config.h
+index 49187a8..133faa1 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -4,7 +4,7 @@
+ #define GLIMMER_PLATFORM_GLFW 2
+ // Keep adding new platforms here...
+ 
+-using ImWchar = unsigned int;
++// ImWchar is now defined by ImGui (removed conflicting typedef)
+ 
+ #ifndef GLIMMER_MAX_GLFW_CLIPBOARD_TEXTSZ
+ #define GLIMMER_MAX_GLFW_CLIPBOARD_TEXTSZ 4096
+diff --git a/src/glimmer.h b/src/glimmer.h
+index f927f2a..e9c1046 100644
+--- a/src/glimmer.h
++++ b/src/glimmer.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ 
++#include "platform_config.h"
+ #include "types.h"
+ #include "renderer.h"
+ #include "style.h"
+diff --git a/src/im_font_manager.cpp b/src/im_font_manager.cpp
+index e0e7997..7d714e4 100644
+--- a/src/im_font_manager.cpp
++++ b/src/im_font_manager.cpp
+@@ -116,13 +116,13 @@ namespace glimmer
+             auto antialias = range.flags & FLT_Antialias;
+ 
+ #ifdef IMGUI_ENABLE_FREETYPE
+-            int32_t flags = !hinting ? ImGuiFreeTypeBuilderFlags_NoHinting :
+-                !antialias ? ImGuiFreeTypeBuilderFlags_MonoHinting : ImGuiFreeTypeBuilderFlags_LightHinting;
+-            flags = flags | (!antialias ? ImGuiFreeTypeBuilderFlags_Monochrome : 0);
++            int32_t flags = !hinting ? ImGuiFreeTypeLoaderFlags_NoHinting :
++                !antialias ? ImGuiFreeTypeLoaderFlags_MonoHinting : ImGuiFreeTypeLoaderFlags_LightHinting;
++            flags = flags | (!antialias ? ImGuiFreeTypeLoaderFlags_Monochrome : 0);
+ #endif
+ 
+             ImGuiIO& io = ImGui::GetIO();
+-            fconfig.FontBuilderFlags = fconfig.FontBuilderFlags | flags;
++            fconfig.FontLoaderFlags = fconfig.FontLoaderFlags | flags;
+             auto path = range.path.data();
+             auto fontptr = io.Fonts->AddFontFromFileTTF(path, size, &fconfig, glyphs);
+             if (!mergeWithPrevious) Config.iconFont = fontptr;
+@@ -136,7 +136,7 @@ namespace glimmer
+ #ifndef GLIMMER_DISABLE_IMGUI_RENDERER
+     static void LoadFont(ImGuiIO& io, FontFamily& family, FontType ft, float size, ImFontConfig config, int flag, bool isMonospace)
+     {
+-        config.FontBuilderFlags = config.FontBuilderFlags | flag;
++        config.FontLoaderFlags = config.FontLoaderFlags | flag;
+ 
+         if (ft == FT_Normal)
+         {
+@@ -176,9 +176,9 @@ namespace glimmer
+     bool LoadFonts(std::string_view family, const FontCollectionFile& files, float size, ImFontConfig config, 
+         bool autoScale, bool isMonospace, bool hinting, bool antialias)
+     {
+-        int32_t flags = !hinting ? ImGuiFreeTypeBuilderFlags_NoHinting : 
+-            !antialias ? ImGuiFreeTypeBuilderFlags_MonoHinting : ImGuiFreeTypeBuilderFlags_LightHinting;
+-        flags = flags | (!antialias ? ImGuiFreeTypeBuilderFlags_Monochrome : 0);
++        int32_t flags = !hinting ? ImGuiFreeTypeLoaderFlags_NoHinting : 
++            !antialias ? ImGuiFreeTypeLoaderFlags_MonoHinting : ImGuiFreeTypeLoaderFlags_LightHinting;
++        flags = flags | (!antialias ? ImGuiFreeTypeLoaderFlags_Monochrome : 0);
+ 
+         ImGuiIO& io = ImGui::GetIO();
+         FontStore[family].Files = files;
+diff --git a/src/im_font_manager.h b/src/im_font_manager.h
+index f0f9dfb..899dd03 100644
+--- a/src/im_font_manager.h
++++ b/src/im_font_manager.h
+@@ -5,6 +5,7 @@
+ #include <vector>
+ 
+ #include "config.h"
++#include "libs/inc/imgui/imgui.h"
+ 
+ namespace glimmer
+ {
+diff --git a/src/libs/src/imrichtext.cpp b/src/libs/src/imrichtext.cpp
+index f9eb35d..7913c5b 100644
+--- a/src/libs/src/imrichtext.cpp
++++ b/src/libs/src/imrichtext.cpp
+@@ -1078,7 +1078,7 @@ namespace ImRichText
+ 
+             startpos.x = ImGui::GetCurrentWindow()->Size.x - sz.x;
+             overlay->AddRectFilled(startpos, startpos + ImVec2{ ImGui::GetCurrentWindow()->Size.x, sz.y }, IM_COL32_WHITE);
+-            overlay->AddText(font, font->FontSize, startpos, IM_COL32_BLACK, buffer, NULL, 300.f);
++            overlay->AddText(font, font->LegacySize, startpos, IM_COL32_BLACK, buffer, NULL, 300.f);
+             ImGui::PopFont();
+             return true;
+         }
+diff --git a/src/platform.cpp b/src/platform.cpp
+index a5afc1e..7992ad1 100644
+--- a/src/platform.cpp
++++ b/src/platform.cpp
+@@ -900,6 +900,7 @@ namespace glimmer
+ 
+     static std::list<SDL_GPUTextureSamplerBinding> SamplerBindings;
+ 
++#ifdef _WIN32
+     bool SDLCALL SDL_CustomWindowsMessageHook(void* userdata, MSG* msg)
+     {
+         if (msg->message == WM_HOTKEY)
+@@ -922,6 +923,7 @@ namespace glimmer
+ 
+         return true;
+     }
++#endif
+ 
+     struct ImGuiSDL3Platform final : public IPlatform
+     {
+@@ -985,8 +987,10 @@ namespace glimmer
+             if (params.size.x == -1.f || params.size.y == -1.f) SDL_MaximizeWindow(window);
+             SDL_ShowWindow(window);
+ 
++#ifdef _WIN32
+             if (totalCustomEvents > 0)
+                 SDL_SetWindowsMessageHook(&SDL_CustomWindowsMessageHook, &custom);
++#endif
+ 
+             // Create GPU Device
+ #ifdef _DEBUG
+diff --git a/src/platform.h b/src/platform.h
+index c5c4e80..d9a346d 100644
+--- a/src/platform.h
++++ b/src/platform.h
+@@ -7,6 +7,7 @@
+ 
+ #include "types.h"
+ 
++// ImRect comparison operators (ImVec2 operators now defined in types.h)
+ inline bool operator==(const ImRect& lhs, const ImRect& rhs)
+ {
+     return lhs.Min == rhs.Min && lhs.Max == rhs.Max;
+@@ -17,11 +18,6 @@ inline bool operator!=(const ImRect& lhs, const ImRect& rhs)
+     return lhs.Min != rhs.Min || lhs.Max != rhs.Max;
+ }
+ 
+-inline bool operator>(ImVec2 lhs, ImVec2 rhs)
+-{
+-    return lhs.x > rhs.x || lhs.y > rhs.y;
+-}
+-
+ #include <string_view>
+ #include <vector>
+ #include <stdint.h>
+diff --git a/src/renderer.cpp b/src/renderer.cpp
+index cede833..446b933 100644
+--- a/src/renderer.cpp
++++ b/src/renderer.cpp
+@@ -65,8 +65,11 @@ namespace glimmer
+         auto imfont = (ImFont*)fontptr;
+         ImVec2 txtsz;
+ 
++        // Get the baked font data for the requested size
++        ImFontBaked* baked = imfont->GetFontBaked(sz);
++
+         if ((int)text.size() > 4 && wrapWidth == -1.f && IsFontMonospace(fontptr))
+-            txtsz = ImVec2{ (float)text.size() * imfont->IndexAdvanceX.front(), sz };
++            txtsz = ImVec2((float)text.size() * baked->IndexAdvanceX.Data[0], sz);
+         else
+         {
+             ImGui::PushFont(imfont);
+@@ -74,7 +77,7 @@ namespace glimmer
+             ImGui::PopFont();
+         }
+ 
+-        auto ratio = (sz / imfont->FontSize);
++        auto ratio = (sz / baked->Size);
+         txtsz.x *= ratio;
+         txtsz.y *= ratio;
+         return txtsz;
+@@ -645,7 +648,10 @@ namespace glimmer
+ 
+     float ImGuiRenderer::EllipsisWidth(void* fontptr, float sz)
+     {
+-        return ((ImFont*)fontptr)->EllipsisWidth;
++        ImFont* font = (ImFont*)fontptr;
++        ImFontBaked* baked = font->GetFontBaked(sz);
++        ImFontGlyph* glyph = baked->FindGlyph(font->EllipsisChar);
++        return glyph ? glyph->AdvanceX : 0.0f;
+     }
+ 
+     bool ImGuiRenderer::StartOverlay(int32_t id, ImVec2 pos, ImVec2 size, uint32_t color)
+diff --git a/src/types.h b/src/types.h
+index 361e293..62a0f62 100644
+--- a/src/types.h
++++ b/src/types.h
+@@ -5,6 +5,77 @@
+ #include "libs/inc/imgui/imgui.h"
+ #include "libs/inc/imgui/imgui_internal.h"
+ 
++// ImVec2 arithmetic operators (ImGui 1.92+ doesn't define these)
++inline ImVec2 operator+(const ImVec2& lhs, const ImVec2& rhs)
++{
++    return ImVec2(lhs.x + rhs.x, lhs.y + rhs.y);
++}
++
++inline ImVec2 operator-(const ImVec2& lhs, const ImVec2& rhs)
++{
++    return ImVec2(lhs.x - rhs.x, lhs.y - rhs.y);
++}
++
++// Unary negation operator
++inline ImVec2 operator-(const ImVec2& v)
++{
++    return ImVec2(-v.x, -v.y);
++}
++
++inline ImVec2 operator*(const ImVec2& lhs, float rhs)
++{
++    return ImVec2(lhs.x * rhs, lhs.y * rhs);
++}
++
++inline ImVec2 operator/(const ImVec2& lhs, float rhs)
++{
++    return ImVec2(lhs.x / rhs, lhs.y / rhs);
++}
++
++inline ImVec2& operator+=(ImVec2& lhs, const ImVec2& rhs)
++{
++    lhs.x += rhs.x;
++    lhs.y += rhs.y;
++    return lhs;
++}
++
++inline ImVec2& operator-=(ImVec2& lhs, const ImVec2& rhs)
++{
++    lhs.x -= rhs.x;
++    lhs.y -= rhs.y;
++    return lhs;
++}
++
++inline ImVec2& operator*=(ImVec2& lhs, float rhs)
++{
++    lhs.x *= rhs;
++    lhs.y *= rhs;
++    return lhs;
++}
++
++inline ImVec2& operator/=(ImVec2& lhs, float rhs)
++{
++    lhs.x /= rhs;
++    lhs.y /= rhs;
++    return lhs;
++}
++
++// ImVec2 comparison operators
++inline bool operator==(const ImVec2& lhs, const ImVec2& rhs)
++{
++    return lhs.x == rhs.x && lhs.y == rhs.y;
++}
++
++inline bool operator!=(const ImVec2& lhs, const ImVec2& rhs)
++{
++    return lhs.x != rhs.x || lhs.y != rhs.y;
++}
++
++inline bool operator>(const ImVec2& lhs, const ImVec2& rhs)
++{
++    return lhs.x > rhs.x || lhs.y > rhs.y;
++}
++
+ #include <string_view>
+ #include <optional>
+ #include <vector>
